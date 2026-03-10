@@ -1,64 +1,380 @@
-import typer
+from __future__ import annotations
 
-app = typer.Typer(help="STM32 AI 调试链路 CLI 原型。")
-debug_app = typer.Typer(help="调试相关命令。")
+import os
+import shutil
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import typer
+import yaml
+
+app = typer.Typer(help="STM32 AI debug-chain CLI prototype.")
+debug_app = typer.Typer(help="Debug-related commands.")
 app.add_typer(debug_app, name="debug")
 
+PROBE_INTERFACE_MAP = {
+    "stlink": "interface/stlink.cfg",
+    "daplink": "interface/cmsis-dap.cfg",
+    "cmsis-dap": "interface/cmsis-dap.cfg",
+}
+COMMON_OPENOCD_HINTS = (
+    "D:/OpenOCD/bin/openocd.exe",
+    "C:/OpenOCD/bin/openocd.exe",
+    "D:/xpack-openocd/bin/openocd.exe",
+    "C:/xpack-openocd/bin/openocd.exe",
+    "D:/ST/OpenOCD/bin/openocd.exe",
+    "C:/ST/OpenOCD/bin/openocd.exe",
+)
+
+
+@dataclass
+class ProjectConfig:
+    config_path: Path | None
+    project_name: str | None
+    workspace: Path | None
+    build_dir: Path | None
+    elf: Path | None
+    probe: str | None
+    interface_cfg: str | None
+    target_cfg: str | None
+    serial_port: str | None
+    baudrate: int | None
+    generator: str | None
+    configure_args: list[str]
+
+
+def _read_yaml(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        data = yaml.safe_load(handle) or {}
+    if not isinstance(data, dict):
+        raise typer.BadParameter(f"Config file must contain a mapping: {path}")
+    return data
+
+
+def _load_config(config: Path | None) -> ProjectConfig:
+    if config is None:
+        return ProjectConfig(None, None, None, None, None, None, None, None, None, None, None, [])
+
+    config = config.resolve()
+    data = _read_yaml(config)
+    config_root = config.parent
+
+    workspace = Path(data["workspace"]).expanduser() if data.get("workspace") else None
+    if workspace is not None and not workspace.is_absolute():
+        workspace = (config_root / workspace).resolve()
+    build_dir_raw = data.get("build_dir")
+    build_dir = Path(build_dir_raw) if build_dir_raw else None
+    if build_dir is not None and workspace is not None and not build_dir.is_absolute():
+        build_dir = workspace / build_dir
+
+    elf_raw = data.get("elf")
+    elf = Path(elf_raw) if elf_raw else None
+    if elf is not None and workspace is not None and not elf.is_absolute():
+        elf = workspace / elf
+
+    return ProjectConfig(
+        config_path=config,
+        project_name=data.get("project_name"),
+        workspace=workspace,
+        build_dir=build_dir,
+        elf=elf,
+        probe=data.get("probe"),
+        interface_cfg=data.get("interface_cfg"),
+        target_cfg=data.get("target_cfg"),
+        serial_port=data.get("serial_port"),
+        baudrate=int(data["baudrate"]) if data.get("baudrate") is not None else None,
+        generator=data.get("generator"),
+        configure_args=[str(item) for item in data.get("configure_args", [])],
+    )
+
+
+def _merge_config(
+    config: ProjectConfig,
+    *,
+    workspace: Path | None = None,
+    build_dir: Path | None = None,
+    elf: Path | None = None,
+    probe: str | None = None,
+    interface_cfg: str | None = None,
+    target_cfg: str | None = None,
+    generator: str | None = None,
+    configure_args: list[str] | None = None,
+) -> ProjectConfig:
+    merged_workspace = workspace or config.workspace
+    merged_build_dir = build_dir or config.build_dir
+    if merged_build_dir is not None and merged_workspace is not None and not merged_build_dir.is_absolute():
+        merged_build_dir = merged_workspace / merged_build_dir
+
+    merged_elf = elf or config.elf
+    if merged_elf is not None and merged_workspace is not None and not merged_elf.is_absolute():
+        merged_elf = merged_workspace / merged_elf
+
+    return ProjectConfig(
+        config_path=config.config_path,
+        project_name=config.project_name,
+        workspace=merged_workspace,
+        build_dir=merged_build_dir,
+        elf=merged_elf,
+        probe=(probe or config.probe),
+        interface_cfg=(interface_cfg or config.interface_cfg),
+        target_cfg=(target_cfg or config.target_cfg),
+        serial_port=config.serial_port,
+        baudrate=config.baudrate,
+        generator=(generator or config.generator),
+        configure_args=(configure_args if configure_args is not None else config.configure_args),
+    )
+
+
+def _require_path(value: Path | None, message: str) -> Path:
+    if value is None:
+        raise typer.BadParameter(message)
+    return value
+
+
+def _resolve_interface_cfg(probe: str | None, interface_cfg: str | None) -> str | None:
+    if interface_cfg:
+        return interface_cfg
+    if probe:
+        return PROBE_INTERFACE_MAP.get(probe.lower(), interface_cfg)
+    return interface_cfg
+
+
+def _resolve_executable(name: str, env_var: str | None = None) -> str | None:
+    env_value = os.environ.get(env_var) if env_var else None
+    if env_value and Path(env_value).exists():
+        return env_value
+
+    found = shutil.which(name)
+    if found:
+        return found
+
+    if name == "openocd":
+        for candidate in COMMON_OPENOCD_HINTS:
+            if Path(candidate).exists():
+                return candidate
+    return None
+
+
+def _run_command(command: list[str], cwd: Path | None = None, dry_run: bool = False) -> subprocess.CompletedProcess[str] | None:
+    typer.echo("$ " + " ".join(command))
+    if dry_run:
+        return None
+
+    completed = subprocess.run(
+        command,
+        cwd=str(cwd) if cwd else None,
+        text=True,
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if completed.stdout:
+        typer.echo(completed.stdout.rstrip())
+    if completed.returncode != 0:
+        if completed.stderr:
+            typer.echo(completed.stderr.rstrip(), err=True)
+        raise typer.Exit(completed.returncode)
+    if completed.stderr:
+        typer.echo(completed.stderr.rstrip(), err=True)
+    return completed
+
+
+def _doctor_checks(config: ProjectConfig) -> list[tuple[str, str]]:
+    workspace = config.workspace
+    interface_cfg = _resolve_interface_cfg(config.probe, config.interface_cfg)
+    target_cfg = config.target_cfg
+    checks = [
+        ("cmake", _resolve_executable("cmake", "CMAKE")),
+        ("ninja", _resolve_executable("ninja", "NINJA")),
+        ("arm-none-eabi-gcc", _resolve_executable("arm-none-eabi-gcc", "ARM_NONE_EABI_GCC")),
+        ("arm-none-eabi-gdb", _resolve_executable("arm-none-eabi-gdb", "ARM_NONE_EABI_GDB")),
+        ("openocd", _resolve_executable("openocd", "OPENOCD")),
+    ]
+    results: list[tuple[str, str]] = []
+    for name, path in checks:
+        results.append((name, path or "MISSING"))
+
+    if workspace is not None:
+        results.append(("workspace", "OK" if workspace.exists() else f"MISSING: {workspace}"))
+        results.append(
+            (
+                "CMakeLists.txt",
+                "OK" if (workspace / "CMakeLists.txt").exists() else f"MISSING: {workspace / 'CMakeLists.txt'}",
+            )
+        )
+        if interface_cfg:
+            results.append(
+                (
+                    "interface_cfg",
+                    "OK" if (workspace / interface_cfg).exists() else f"CHECK: {workspace / interface_cfg}",
+                )
+            )
+        if target_cfg:
+            results.append(
+                (
+                    "target_cfg",
+                    "OK" if (workspace / target_cfg).exists() else f"CHECK: {workspace / target_cfg}",
+                )
+            )
+        if config.elf:
+            results.append(("elf", "OK" if config.elf.exists() else f"CHECK: {config.elf}"))
+    return results
+
 
 @app.command()
-def build() -> None:
-    """构建当前 STM32 工程。"""
-    typer.echo("TODO: build workflow")
+def doctor(
+    config: Path | None = typer.Option(None, "--config", "-c", help="Path to a YAML project config."),
+) -> None:
+    """Check required tools and project paths."""
+    project = _load_config(config)
+    ok = True
+    for name, result in _doctor_checks(project):
+        typer.echo(f"{name:18} {result}")
+        if result == "MISSING" or result.startswith("MISSING:"):
+            ok = False
+
+    if not ok:
+        raise typer.Exit(1)
 
 
 @app.command()
-def flash() -> None:
-    """烧录 ELF 到目标板。"""
-    typer.echo("TODO: flash workflow")
+def build(
+    config: Path | None = typer.Option(None, "--config", "-c", help="Path to a YAML project config."),
+    workspace: Path | None = typer.Option(None, help="STM32 project root containing CMakeLists.txt."),
+    build_dir: Path | None = typer.Option(None, help="Build directory."),
+    target: str = typer.Option("all", help="CMake build target."),
+    jobs: int = typer.Option(0, min=0, help="Parallel build jobs. 0 means use CMake default."),
+    generator: str | None = typer.Option(None, help="CMake generator, for example Ninja."),
+    configure_arg: list[str] | None = typer.Option(None, "--configure-arg", help="Extra configure arguments."),
+    configure: bool = typer.Option(True, help="Run CMake configure before building."),
+    fresh: bool = typer.Option(False, help="Remove the build directory before configuring."),
+    dry_run: bool = typer.Option(False, help="Print commands only."),
+) -> None:
+    """Build the current STM32 project with CMake."""
+    project = _merge_config(
+        _load_config(config),
+        workspace=workspace,
+        build_dir=build_dir,
+        generator=generator,
+        configure_args=configure_arg,
+    )
+    resolved_workspace = _require_path(project.workspace, "workspace is required")
+    resolved_build_dir = project.build_dir or (resolved_workspace / "build")
+    cmake = _resolve_executable("cmake", "CMAKE")
+    if not cmake:
+        raise typer.BadParameter("cmake was not found. Add it to PATH or set CMAKE.")
+    if not (resolved_workspace / "CMakeLists.txt").exists():
+        raise typer.BadParameter(f"CMakeLists.txt not found under {resolved_workspace}")
+
+    if configure:
+        if fresh and resolved_build_dir.exists() and not dry_run:
+            shutil.rmtree(resolved_build_dir)
+        configure_command = [cmake, "-S", str(resolved_workspace), "-B", str(resolved_build_dir)]
+        resolved_generator = project.generator or (_resolve_executable("ninja", "NINJA") and "Ninja")
+        if resolved_generator:
+            configure_command.extend(["-G", resolved_generator])
+        configure_command.extend(project.configure_args)
+        _run_command(configure_command, dry_run=dry_run)
+
+    command = [cmake, "--build", str(resolved_build_dir), "--target", target]
+    if jobs > 0:
+        command.extend(["-j", str(jobs)])
+    _run_command(command, cwd=resolved_workspace, dry_run=dry_run)
+
+
+@app.command()
+def flash(
+    config: Path | None = typer.Option(None, "--config", "-c", help="Path to a YAML project config."),
+    workspace: Path | None = typer.Option(None, help="STM32 project root."),
+    elf: Path | None = typer.Option(None, help="ELF path."),
+    probe: str | None = typer.Option(None, help="Probe type: stlink, daplink, cmsis-dap."),
+    interface_cfg: str | None = typer.Option(None, help="OpenOCD interface config path."),
+    target_cfg: str | None = typer.Option(None, help="OpenOCD target config path."),
+    openocd_path: str | None = typer.Option(None, help="Explicit path to openocd."),
+    dry_run: bool = typer.Option(False, help="Print commands only."),
+) -> None:
+    """Flash ELF to target board with OpenOCD."""
+    project = _merge_config(
+        _load_config(config),
+        workspace=workspace,
+        elf=elf,
+        probe=probe,
+        interface_cfg=interface_cfg,
+        target_cfg=target_cfg,
+    )
+    resolved_workspace = _require_path(project.workspace, "workspace is required")
+    resolved_elf = _require_path(project.elf, "elf is required")
+    resolved_interface = _resolve_interface_cfg(project.probe, project.interface_cfg)
+    if not resolved_interface:
+        raise typer.BadParameter("interface_cfg is required unless probe maps to a known interface")
+    if not project.target_cfg:
+        raise typer.BadParameter("target_cfg is required")
+
+    openocd = openocd_path or _resolve_executable("openocd", "OPENOCD")
+    if not openocd:
+        raise typer.BadParameter("openocd was not found. Add it to PATH or set OPENOCD.")
+    if not resolved_elf.exists() and not dry_run:
+        raise typer.BadParameter(f"ELF not found: {resolved_elf}")
+
+    command = [
+        openocd,
+        "-f",
+        resolved_interface,
+        "-f",
+        project.target_cfg,
+        "-c",
+        f"program {resolved_elf} verify reset exit",
+    ]
+    _run_command(command, cwd=resolved_workspace, dry_run=dry_run)
 
 
 @app.command()
 def monitor() -> None:
-    """启动串口监视。"""
-    typer.echo("TODO: monitor workflow")
+    """Serial monitor is not implemented yet."""
+    raise typer.Exit("monitor is not implemented yet")
+
+
+def _not_implemented(command_name: str) -> None:
+    raise typer.Exit(f"{command_name} is not implemented yet")
 
 
 @debug_app.command("start")
 def debug_start() -> None:
-    """启动 OpenOCD + GDB 调试会话。"""
-    typer.echo("TODO: debug start")
+    """Start an OpenOCD + GDB debug session."""
+    _not_implemented("debug start")
 
 
 @debug_app.command("stop")
 def debug_stop() -> None:
-    """停止当前调试会话。"""
-    typer.echo("TODO: debug stop")
+    """Stop the current debug session."""
+    _not_implemented("debug stop")
 
 
 @debug_app.command("step")
 def debug_step() -> None:
-    """执行单步调试。"""
-    typer.echo("TODO: debug step")
+    """Perform one debug step."""
+    _not_implemented("debug step")
 
 
 @debug_app.command("continue")
 def debug_continue() -> None:
-    """继续执行当前程序。"""
-    typer.echo("TODO: debug continue")
+    """Continue the current debug session."""
+    _not_implemented("debug continue")
 
 
 @debug_app.command("registers")
 def debug_registers() -> None:
-    """读取寄存器。"""
-    typer.echo("TODO: debug registers")
+    """Dump registers from the current debug session."""
+    _not_implemented("debug registers")
 
 
 @debug_app.command("backtrace")
 def debug_backtrace() -> None:
-    """读取堆栈回溯。"""
-    typer.echo("TODO: debug backtrace")
+    """Dump the current backtrace."""
+    _not_implemented("debug backtrace")
 
 
 if __name__ == "__main__":
     app()
-
