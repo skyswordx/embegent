@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import os
+import json
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+import time
 
 import typer
 import yaml
@@ -43,6 +45,8 @@ class ProjectConfig:
     baudrate: int | None
     generator: str | None
     configure_args: list[str]
+    gdb_port: int | None
+    openocd_args: list[str]
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -55,7 +59,7 @@ def _read_yaml(path: Path) -> dict[str, Any]:
 
 def _load_config(config: Path | None) -> ProjectConfig:
     if config is None:
-        return ProjectConfig(None, None, None, None, None, None, None, None, None, None, None, [])
+        return ProjectConfig(None, None, None, None, None, None, None, None, None, None, None, [], None, [])
 
     config = config.resolve()
     data = _read_yaml(config)
@@ -87,6 +91,8 @@ def _load_config(config: Path | None) -> ProjectConfig:
         baudrate=int(data["baudrate"]) if data.get("baudrate") is not None else None,
         generator=data.get("generator"),
         configure_args=[str(item) for item in data.get("configure_args", [])],
+        gdb_port=int(data["gdb_port"]) if data.get("gdb_port") is not None else None,
+        openocd_args=[str(item) for item in data.get("openocd_args", [])],
     )
 
 
@@ -101,6 +107,8 @@ def _merge_config(
     target_cfg: str | None = None,
     generator: str | None = None,
     configure_args: list[str] | None = None,
+    gdb_port: int | None = None,
+    openocd_args: list[str] | None = None,
 ) -> ProjectConfig:
     merged_workspace = workspace or config.workspace
     merged_build_dir = build_dir or config.build_dir
@@ -124,6 +132,8 @@ def _merge_config(
         baudrate=config.baudrate,
         generator=(generator or config.generator),
         configure_args=(configure_args if configure_args is not None else config.configure_args),
+        gdb_port=(gdb_port or config.gdb_port),
+        openocd_args=(openocd_args if openocd_args is not None else config.openocd_args),
     )
 
 
@@ -139,6 +149,13 @@ def _resolve_interface_cfg(probe: str | None, interface_cfg: str | None) -> str 
     if probe:
         return PROBE_INTERFACE_MAP.get(probe.lower(), interface_cfg)
     return interface_cfg
+
+
+def _resolve_cfg_path(workspace: Path, cfg: str) -> str:
+    candidate = Path(cfg)
+    if candidate.is_absolute():
+        return str(candidate)
+    return str(workspace / candidate)
 
 
 def _resolve_executable(name: str, env_var: str | None = None) -> str | None:
@@ -164,6 +181,79 @@ def _run_command(command: list[str], cwd: Path | None = None, dry_run: bool = Fa
 
     completed = subprocess.run(
         command,
+        cwd=str(cwd) if cwd else None,
+        text=True,
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if completed.stdout:
+        typer.echo(completed.stdout.rstrip())
+    if completed.returncode != 0:
+        if completed.stderr:
+            typer.echo(completed.stderr.rstrip(), err=True)
+        raise typer.Exit(completed.returncode)
+    if completed.stderr:
+        typer.echo(completed.stderr.rstrip(), err=True)
+    return completed
+
+
+def _state_dir(workspace: Path) -> Path:
+    return workspace / ".stm32-agent"
+
+
+def _logs_dir(workspace: Path) -> Path:
+    return _state_dir(workspace) / "logs"
+
+
+def _session_file(workspace: Path) -> Path:
+    return _state_dir(workspace) / "session.json"
+
+
+def _ensure_state_dirs(workspace: Path) -> None:
+    _logs_dir(workspace).mkdir(parents=True, exist_ok=True)
+
+
+def _write_session(workspace: Path, payload: dict[str, Any]) -> None:
+    _ensure_state_dirs(workspace)
+    _session_file(workspace).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _read_session(workspace: Path) -> dict[str, Any]:
+    session_path = _session_file(workspace)
+    if not session_path.exists():
+        raise typer.BadParameter(f"session file not found: {session_path}")
+    return json.loads(session_path.read_text(encoding="utf-8"))
+
+
+def _remove_session(workspace: Path) -> None:
+    session_path = _session_file(workspace)
+    if session_path.exists():
+        session_path.unlink()
+
+
+def _terminate_pid(pid: int) -> None:
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    else:
+        os.kill(pid, 15)
+
+
+def _run_gdb_batch(gdb: str, elf: Path, gdb_port: int, commands: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    gdb_command = [gdb, "--quiet", str(elf)]
+    gdb_command.extend(["-ex", f"target extended-remote localhost:{gdb_port}"])
+    for item in commands:
+        gdb_command.extend(["-ex", item])
+    gdb_command.extend(["-ex", "quit"])
+    completed = subprocess.run(
+        gdb_command,
         cwd=str(cwd) if cwd else None,
         text=True,
         capture_output=True,
@@ -321,9 +411,9 @@ def flash(
     command = [
         openocd,
         "-f",
-        resolved_interface,
+        _resolve_cfg_path(resolved_workspace, resolved_interface),
         "-f",
-        project.target_cfg,
+        _resolve_cfg_path(resolved_workspace, project.target_cfg),
         "-c",
         f"program {resolved_elf} verify reset exit",
     ]
@@ -341,15 +431,107 @@ def _not_implemented(command_name: str) -> None:
 
 
 @debug_app.command("start")
-def debug_start() -> None:
-    """Start an OpenOCD + GDB debug session."""
-    _not_implemented("debug start")
+def debug_start(
+    config: Path | None = typer.Option(None, "--config", "-c", help="Path to a YAML project config."),
+    workspace: Path | None = typer.Option(None, help="STM32 project root."),
+    elf: Path | None = typer.Option(None, help="ELF path."),
+    probe: str | None = typer.Option(None, help="Probe type: stlink, daplink, cmsis-dap."),
+    interface_cfg: str | None = typer.Option(None, help="OpenOCD interface config path."),
+    target_cfg: str | None = typer.Option(None, help="OpenOCD target config path."),
+    openocd_path: str | None = typer.Option(None, help="Explicit path to openocd."),
+    gdb_port: int = typer.Option(3333, help="OpenOCD GDB port."),
+    dry_run: bool = typer.Option(False, help="Print commands only."),
+) -> None:
+    """Start an OpenOCD-backed debug session."""
+    project = _merge_config(
+        _load_config(config),
+        workspace=workspace,
+        elf=elf,
+        probe=probe,
+        interface_cfg=interface_cfg,
+        target_cfg=target_cfg,
+        gdb_port=gdb_port,
+    )
+    resolved_workspace = _require_path(project.workspace, "workspace is required")
+    resolved_elf = _require_path(project.elf, "elf is required")
+    resolved_interface = _resolve_interface_cfg(project.probe, project.interface_cfg)
+    if not resolved_interface:
+        raise typer.BadParameter("interface_cfg is required unless probe maps to a known interface")
+    if not project.target_cfg:
+        raise typer.BadParameter("target_cfg is required")
+
+    openocd = openocd_path or _resolve_executable("openocd", "OPENOCD")
+    if not openocd:
+        raise typer.BadParameter("openocd was not found. Add it to PATH or set OPENOCD.")
+
+    session_path = _session_file(resolved_workspace)
+    if session_path.exists():
+        raise typer.BadParameter(f"debug session already exists: {session_path}")
+
+    interface_path = _resolve_cfg_path(resolved_workspace, resolved_interface)
+    target_path = _resolve_cfg_path(resolved_workspace, project.target_cfg)
+    command = [
+        openocd,
+        "-f",
+        interface_path,
+        "-f",
+        target_path,
+        "-c",
+        f"gdb_port {project.gdb_port or gdb_port}",
+    ]
+    command.extend(project.openocd_args)
+    typer.echo("$ " + " ".join(command))
+    if dry_run:
+        return
+
+    _ensure_state_dirs(resolved_workspace)
+    timestamp = int(time.time())
+    openocd_log = _logs_dir(resolved_workspace) / f"openocd-{timestamp}.log"
+    with openocd_log.open("w", encoding="utf-8") as handle:
+        process = subprocess.Popen(
+            command,
+            cwd=str(resolved_workspace),
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+    time.sleep(1.0)
+    if process.poll() is not None:
+        log_text = openocd_log.read_text(encoding="utf-8", errors="replace") if openocd_log.exists() else ""
+        typer.echo(log_text.rstrip(), err=True)
+        raise typer.Exit(process.returncode or 1)
+
+    payload = {
+        "workspace": str(resolved_workspace),
+        "elf": str(resolved_elf),
+        "probe": project.probe,
+        "interface_cfg": interface_path,
+        "target_cfg": target_path,
+        "gdb_port": project.gdb_port or gdb_port,
+        "openocd_pid": process.pid,
+        "openocd_log": str(openocd_log),
+        "started_at": timestamp,
+    }
+    _write_session(resolved_workspace, payload)
+    typer.echo(f"session started: {session_path}")
 
 
 @debug_app.command("stop")
-def debug_stop() -> None:
+def debug_stop(
+    config: Path | None = typer.Option(None, "--config", "-c", help="Path to a YAML project config."),
+    workspace: Path | None = typer.Option(None, help="STM32 project root."),
+) -> None:
     """Stop the current debug session."""
-    _not_implemented("debug stop")
+    project = _merge_config(_load_config(config), workspace=workspace)
+    resolved_workspace = _require_path(project.workspace, "workspace is required")
+    session = _read_session(resolved_workspace)
+    pid = int(session["openocd_pid"])
+    _terminate_pid(pid)
+    _remove_session(resolved_workspace)
+    typer.echo(f"session stopped: pid={pid}")
 
 
 @debug_app.command("step")
@@ -365,15 +547,45 @@ def debug_continue() -> None:
 
 
 @debug_app.command("registers")
-def debug_registers() -> None:
+def debug_registers(
+    config: Path | None = typer.Option(None, "--config", "-c", help="Path to a YAML project config."),
+    workspace: Path | None = typer.Option(None, help="STM32 project root."),
+) -> None:
     """Dump registers from the current debug session."""
-    _not_implemented("debug registers")
+    project = _merge_config(_load_config(config), workspace=workspace)
+    resolved_workspace = _require_path(project.workspace, "workspace is required")
+    session = _read_session(resolved_workspace)
+    gdb = _resolve_executable("arm-none-eabi-gdb", "ARM_NONE_EABI_GDB")
+    if not gdb:
+        raise typer.BadParameter("arm-none-eabi-gdb was not found. Add it to PATH or set ARM_NONE_EABI_GDB.")
+    _run_gdb_batch(
+        gdb,
+        Path(session["elf"]),
+        int(session["gdb_port"]),
+        ["monitor reset halt", "info registers"],
+        cwd=resolved_workspace,
+    )
 
 
 @debug_app.command("backtrace")
-def debug_backtrace() -> None:
+def debug_backtrace(
+    config: Path | None = typer.Option(None, "--config", "-c", help="Path to a YAML project config."),
+    workspace: Path | None = typer.Option(None, help="STM32 project root."),
+) -> None:
     """Dump the current backtrace."""
-    _not_implemented("debug backtrace")
+    project = _merge_config(_load_config(config), workspace=workspace)
+    resolved_workspace = _require_path(project.workspace, "workspace is required")
+    session = _read_session(resolved_workspace)
+    gdb = _resolve_executable("arm-none-eabi-gdb", "ARM_NONE_EABI_GDB")
+    if not gdb:
+        raise typer.BadParameter("arm-none-eabi-gdb was not found. Add it to PATH or set ARM_NONE_EABI_GDB.")
+    _run_gdb_batch(
+        gdb,
+        Path(session["elf"]),
+        int(session["gdb_port"]),
+        ["monitor reset halt", "bt"],
+        cwd=resolved_workspace,
+    )
 
 
 if __name__ == "__main__":
