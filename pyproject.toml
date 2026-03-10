@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stm32-ai-agent"
+version = "0.1.0"
+description = "CLI and MCP tooling prototype for STM32 build/flash/debug/monitor workflows."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "pyserial>=3.5",
+  "typer>=0.12,<1.0",
+  "pydantic>=2.7,<3.0",
+]
+
+[project.scripts]
+stm32-agent = "stm32_agent.cli:app"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

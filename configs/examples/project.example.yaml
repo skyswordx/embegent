@@ -1,0 +1,9 @@
+project_name: demo_f407
+workspace: D:/path/to/stm32-project
+build_dir: build
+elf: build/demo.elf
+probe: stlink
+interface_cfg: interface/stlink.cfg
+target_cfg: target/stm32f4x.cfg
+serial_port: COM6
+baudrate: 115200
