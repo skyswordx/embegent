@@ -1,0 +1,9 @@
+project_name: stm32_stlink_demo
+backend: stlink
+workspace: D:/path/to/stm32-project
+elf: build/demo.elf
+probe: stlink
+gdb_port: 3333
+serial_number: E1007200D0D2139393740544
+frequency_khz: 4000
+stlink_gdb_server_args: []

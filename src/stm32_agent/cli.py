@@ -29,6 +29,14 @@ COMMON_OPENOCD_HINTS = (
     "D:/ST/OpenOCD/bin/openocd.exe",
     "C:/ST/OpenOCD/bin/openocd.exe",
 )
+COMMON_STLINK_GDB_SERVER_HINTS = (
+    "D:/STM32CubeCLT_1.19.0/STLink-gdb-server/bin/ST-LINK_gdbserver.exe",
+    "C:/ST/STM32CubeCLT_1.19.0/STLink-gdb-server/bin/ST-LINK_gdbserver.exe",
+)
+COMMON_CUBEPROGRAMMER_HINTS = (
+    "D:/STM32CubeCLT_1.19.0/STM32CubeProgrammer/bin/STM32_Programmer_CLI.exe",
+    "C:/ST/STM32CubeCLT_1.19.0/STM32CubeProgrammer/bin/STM32_Programmer_CLI.exe",
+)
 
 
 @dataclass
@@ -47,6 +55,10 @@ class ProjectConfig:
     configure_args: list[str]
     gdb_port: int | None
     openocd_args: list[str]
+    backend: str | None
+    stlink_gdb_server_args: list[str]
+    serial_number: str | None
+    frequency_khz: int | None
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -59,7 +71,7 @@ def _read_yaml(path: Path) -> dict[str, Any]:
 
 def _load_config(config: Path | None) -> ProjectConfig:
     if config is None:
-        return ProjectConfig(None, None, None, None, None, None, None, None, None, None, None, [], None, [])
+        return ProjectConfig(None, None, None, None, None, None, None, None, None, None, None, [], None, [], None, [], None, None)
 
     config = config.resolve()
     data = _read_yaml(config)
@@ -93,6 +105,10 @@ def _load_config(config: Path | None) -> ProjectConfig:
         configure_args=[str(item) for item in data.get("configure_args", [])],
         gdb_port=int(data["gdb_port"]) if data.get("gdb_port") is not None else None,
         openocd_args=[str(item) for item in data.get("openocd_args", [])],
+        backend=data.get("backend"),
+        stlink_gdb_server_args=[str(item) for item in data.get("stlink_gdb_server_args", [])],
+        serial_number=data.get("serial_number"),
+        frequency_khz=int(data["frequency_khz"]) if data.get("frequency_khz") is not None else None,
     )
 
 
@@ -109,6 +125,10 @@ def _merge_config(
     configure_args: list[str] | None = None,
     gdb_port: int | None = None,
     openocd_args: list[str] | None = None,
+    backend: str | None = None,
+    stlink_gdb_server_args: list[str] | None = None,
+    serial_number: str | None = None,
+    frequency_khz: int | None = None,
 ) -> ProjectConfig:
     merged_workspace = workspace or config.workspace
     merged_build_dir = build_dir or config.build_dir
@@ -134,6 +154,12 @@ def _merge_config(
         configure_args=(configure_args if configure_args is not None else config.configure_args),
         gdb_port=(gdb_port or config.gdb_port),
         openocd_args=(openocd_args if openocd_args is not None else config.openocd_args),
+        backend=(backend or config.backend),
+        stlink_gdb_server_args=(
+            stlink_gdb_server_args if stlink_gdb_server_args is not None else config.stlink_gdb_server_args
+        ),
+        serial_number=(serial_number or config.serial_number),
+        frequency_khz=(frequency_khz or config.frequency_khz),
     )
 
 
@@ -171,7 +197,25 @@ def _resolve_executable(name: str, env_var: str | None = None) -> str | None:
         for candidate in COMMON_OPENOCD_HINTS:
             if Path(candidate).exists():
                 return candidate
+    if name == "stlink_gdbserver":
+        for candidate in COMMON_STLINK_GDB_SERVER_HINTS:
+            if Path(candidate).exists():
+                return candidate
+    if name == "stm32_programmer_cli":
+        for candidate in COMMON_CUBEPROGRAMMER_HINTS:
+            if Path(candidate).exists():
+                return candidate
     return None
+
+
+def _resolve_backend(config: ProjectConfig, backend: str | None = None) -> str:
+    resolved = (backend or config.backend or "openocd").strip().lower()
+    aliases = {
+        "stlink-gdb-server": "stlink",
+        "stlink_gdb_server": "stlink",
+        "st-link": "stlink",
+    }
+    return aliases.get(resolved, resolved)
 
 
 def _run_command(command: list[str], cwd: Path | None = None, dry_run: bool = False) -> subprocess.CompletedProcess[str] | None:
@@ -281,6 +325,8 @@ def _doctor_checks(config: ProjectConfig) -> list[tuple[str, str]]:
         ("arm-none-eabi-gcc", _resolve_executable("arm-none-eabi-gcc", "ARM_NONE_EABI_GCC")),
         ("arm-none-eabi-gdb", _resolve_executable("arm-none-eabi-gdb", "ARM_NONE_EABI_GDB")),
         ("openocd", _resolve_executable("openocd", "OPENOCD")),
+        ("stlink_gdbserver", _resolve_executable("stlink_gdbserver", "STLINK_GDB_SERVER")),
+        ("stm32_programmer_cli", _resolve_executable("stm32_programmer_cli", "STM32_PROGRAMMER_CLI")),
     ]
     results: list[tuple[str, str]] = []
     for name, path in checks:
@@ -313,16 +359,34 @@ def _doctor_checks(config: ProjectConfig) -> list[tuple[str, str]]:
     return results
 
 
+def _doctor_required_keys(config: ProjectConfig) -> set[str]:
+    backend = _resolve_backend(config)
+    required = {
+        "cmake",
+        "ninja",
+        "arm-none-eabi-gcc",
+        "arm-none-eabi-gdb",
+    }
+    if backend == "openocd":
+        required.add("openocd")
+    elif backend == "stlink":
+        required.add("stlink_gdbserver")
+        required.add("stm32_programmer_cli")
+    return required
+
+
 @app.command()
 def doctor(
     config: Path | None = typer.Option(None, "--config", "-c", help="Path to a YAML project config."),
 ) -> None:
     """Check required tools and project paths."""
     project = _load_config(config)
+    typer.echo(f"{'backend':18} {_resolve_backend(project)}")
     ok = True
+    required_keys = _doctor_required_keys(project)
     for name, result in _doctor_checks(project):
         typer.echo(f"{name:18} {result}")
-        if result == "MISSING" or result.startswith("MISSING:"):
+        if name in required_keys and (result == "MISSING" or result.startswith("MISSING:")):
             ok = False
 
     if not ok:
@@ -383,9 +447,14 @@ def flash(
     interface_cfg: str | None = typer.Option(None, help="OpenOCD interface config path."),
     target_cfg: str | None = typer.Option(None, help="OpenOCD target config path."),
     openocd_path: str | None = typer.Option(None, help="Explicit path to openocd."),
+    backend: str | None = typer.Option(None, help="Flash backend: openocd or stlink."),
+    stlink_gdb_server_path: str | None = typer.Option(None, help="Explicit path to ST-LINK_gdbserver."),
+    cubeprogrammer_path: str | None = typer.Option(None, help="Explicit path to STM32_Programmer_CLI."),
+    serial_number: str | None = typer.Option(None, help="ST-LINK serial number."),
+    frequency_khz: int | None = typer.Option(None, help="SWD/JTAG frequency in kHz."),
     dry_run: bool = typer.Option(False, help="Print commands only."),
 ) -> None:
-    """Flash ELF to target board with OpenOCD."""
+    """Flash ELF to target board."""
     project = _merge_config(
         _load_config(config),
         workspace=workspace,
@@ -393,31 +462,55 @@ def flash(
         probe=probe,
         interface_cfg=interface_cfg,
         target_cfg=target_cfg,
+        backend=backend,
+        serial_number=serial_number,
+        frequency_khz=frequency_khz,
     )
     resolved_workspace = _require_path(project.workspace, "workspace is required")
     resolved_elf = _require_path(project.elf, "elf is required")
-    resolved_interface = _resolve_interface_cfg(project.probe, project.interface_cfg)
-    if not resolved_interface:
-        raise typer.BadParameter("interface_cfg is required unless probe maps to a known interface")
-    if not project.target_cfg:
-        raise typer.BadParameter("target_cfg is required")
-
-    openocd = openocd_path or _resolve_executable("openocd", "OPENOCD")
-    if not openocd:
-        raise typer.BadParameter("openocd was not found. Add it to PATH or set OPENOCD.")
     if not resolved_elf.exists() and not dry_run:
         raise typer.BadParameter(f"ELF not found: {resolved_elf}")
 
-    command = [
-        openocd,
-        "-f",
-        _resolve_cfg_path(resolved_workspace, resolved_interface),
-        "-f",
-        _resolve_cfg_path(resolved_workspace, project.target_cfg),
-        "-c",
-        f"program {resolved_elf} verify reset exit",
-    ]
-    _run_command(command, cwd=resolved_workspace, dry_run=dry_run)
+    resolved_backend = _resolve_backend(project, backend)
+    if resolved_backend == "openocd":
+        resolved_interface = _resolve_interface_cfg(project.probe, project.interface_cfg)
+        if not resolved_interface:
+            raise typer.BadParameter("interface_cfg is required unless probe maps to a known interface")
+        if not project.target_cfg:
+            raise typer.BadParameter("target_cfg is required")
+
+        openocd = openocd_path or _resolve_executable("openocd", "OPENOCD")
+        if not openocd:
+            raise typer.BadParameter("openocd was not found. Add it to PATH or set OPENOCD.")
+
+        command = [
+            openocd,
+            "-f",
+            _resolve_cfg_path(resolved_workspace, resolved_interface),
+            "-f",
+            _resolve_cfg_path(resolved_workspace, project.target_cfg),
+            "-c",
+            f"program {resolved_elf} verify reset exit",
+        ]
+        _run_command(command, cwd=resolved_workspace, dry_run=dry_run)
+        return
+
+    if resolved_backend == "stlink":
+        cubeprogrammer = cubeprogrammer_path or _resolve_executable("stm32_programmer_cli", "STM32_PROGRAMMER_CLI")
+        if not cubeprogrammer:
+            raise typer.BadParameter(
+                "STM32_Programmer_CLI was not found. Add it to PATH or set STM32_PROGRAMMER_CLI."
+            )
+        connect_arg = "port=SWD"
+        if project.serial_number:
+            connect_arg += f" sn={project.serial_number}"
+        if project.frequency_khz:
+            connect_arg += f" freq={project.frequency_khz}"
+        command = [cubeprogrammer, "-c", connect_arg, "-w", str(resolved_elf), "-v", "-rst"]
+        _run_command(command, cwd=resolved_workspace, dry_run=dry_run)
+        return
+
+    raise typer.BadParameter(f"Unsupported backend: {resolved_backend}")
 
 
 @app.command()
@@ -439,10 +532,15 @@ def debug_start(
     interface_cfg: str | None = typer.Option(None, help="OpenOCD interface config path."),
     target_cfg: str | None = typer.Option(None, help="OpenOCD target config path."),
     openocd_path: str | None = typer.Option(None, help="Explicit path to openocd."),
+    backend: str | None = typer.Option(None, help="Debug backend: openocd or stlink."),
+    stlink_gdb_server_path: str | None = typer.Option(None, help="Explicit path to ST-LINK_gdbserver."),
+    cubeprogrammer_path: str | None = typer.Option(None, help="Explicit path to STM32_Programmer_CLI."),
+    serial_number: str | None = typer.Option(None, help="ST-LINK serial number."),
+    frequency_khz: int | None = typer.Option(None, help="SWD/JTAG frequency in kHz."),
     gdb_port: int = typer.Option(3333, help="OpenOCD GDB port."),
     dry_run: bool = typer.Option(False, help="Print commands only."),
 ) -> None:
-    """Start an OpenOCD-backed debug session."""
+    """Start a debug session."""
     project = _merge_config(
         _load_config(config),
         workspace=workspace,
@@ -451,35 +549,69 @@ def debug_start(
         interface_cfg=interface_cfg,
         target_cfg=target_cfg,
         gdb_port=gdb_port,
+        backend=backend,
+        serial_number=serial_number,
+        frequency_khz=frequency_khz,
     )
     resolved_workspace = _require_path(project.workspace, "workspace is required")
     resolved_elf = _require_path(project.elf, "elf is required")
-    resolved_interface = _resolve_interface_cfg(project.probe, project.interface_cfg)
-    if not resolved_interface:
-        raise typer.BadParameter("interface_cfg is required unless probe maps to a known interface")
-    if not project.target_cfg:
-        raise typer.BadParameter("target_cfg is required")
-
-    openocd = openocd_path or _resolve_executable("openocd", "OPENOCD")
-    if not openocd:
-        raise typer.BadParameter("openocd was not found. Add it to PATH or set OPENOCD.")
-
     session_path = _session_file(resolved_workspace)
     if session_path.exists():
         raise typer.BadParameter(f"debug session already exists: {session_path}")
 
-    interface_path = _resolve_cfg_path(resolved_workspace, resolved_interface)
-    target_path = _resolve_cfg_path(resolved_workspace, project.target_cfg)
-    command = [
-        openocd,
-        "-f",
-        interface_path,
-        "-f",
-        target_path,
-        "-c",
-        f"gdb_port {project.gdb_port or gdb_port}",
-    ]
-    command.extend(project.openocd_args)
+    resolved_backend = _resolve_backend(project, backend)
+    interface_path = None
+    target_path = None
+    command: list[str]
+    session_kind: str
+    gdb_port_value = project.gdb_port or gdb_port
+    if resolved_backend == "openocd":
+        resolved_interface = _resolve_interface_cfg(project.probe, project.interface_cfg)
+        if not resolved_interface:
+            raise typer.BadParameter("interface_cfg is required unless probe maps to a known interface")
+        if not project.target_cfg:
+            raise typer.BadParameter("target_cfg is required")
+        openocd = openocd_path or _resolve_executable("openocd", "OPENOCD")
+        if not openocd:
+            raise typer.BadParameter("openocd was not found. Add it to PATH or set OPENOCD.")
+        interface_path = _resolve_cfg_path(resolved_workspace, resolved_interface)
+        target_path = _resolve_cfg_path(resolved_workspace, project.target_cfg)
+        command = [
+            openocd,
+            "-f",
+            interface_path,
+            "-f",
+            target_path,
+            "-c",
+            f"gdb_port {gdb_port_value}",
+        ]
+        command.extend(project.openocd_args)
+        session_kind = "openocd"
+    elif resolved_backend == "stlink":
+        stlink_gdbserver = stlink_gdb_server_path or _resolve_executable("stlink_gdbserver", "STLINK_GDB_SERVER")
+        if not stlink_gdbserver:
+            raise typer.BadParameter(
+                "ST-LINK_gdbserver was not found. Add it to PATH or set STLINK_GDB_SERVER."
+            )
+        cubeprogrammer_dir = None
+        if cubeprogrammer_path:
+            cubeprogrammer_dir = str(Path(cubeprogrammer_path).resolve().parent)
+        else:
+            cubeprogrammer = _resolve_executable("stm32_programmer_cli", "STM32_PROGRAMMER_CLI")
+            if cubeprogrammer:
+                cubeprogrammer_dir = str(Path(cubeprogrammer).resolve().parent)
+        command = [stlink_gdbserver, "-e", "-d", "-p", str(gdb_port_value)]
+        if cubeprogrammer_dir:
+            command.extend(["-cp", cubeprogrammer_dir])
+        if project.serial_number:
+            command.extend(["-i", project.serial_number])
+        if project.frequency_khz:
+            command.extend(["--frequency", str(project.frequency_khz)])
+        command.extend(project.stlink_gdb_server_args)
+        session_kind = "stlink_gdbserver"
+    else:
+        raise typer.BadParameter(f"Unsupported backend: {resolved_backend}")
+
     typer.echo("$ " + " ".join(command))
     if dry_run:
         return
@@ -507,12 +639,14 @@ def debug_start(
     payload = {
         "workspace": str(resolved_workspace),
         "elf": str(resolved_elf),
+        "backend": resolved_backend,
         "probe": project.probe,
         "interface_cfg": interface_path,
         "target_cfg": target_path,
-        "gdb_port": project.gdb_port or gdb_port,
-        "openocd_pid": process.pid,
-        "openocd_log": str(openocd_log),
+        "gdb_port": gdb_port_value,
+        "server_kind": session_kind,
+        "server_pid": process.pid,
+        "server_log": str(openocd_log),
         "started_at": timestamp,
     }
     _write_session(resolved_workspace, payload)
@@ -528,7 +662,7 @@ def debug_stop(
     project = _merge_config(_load_config(config), workspace=workspace)
     resolved_workspace = _require_path(project.workspace, "workspace is required")
     session = _read_session(resolved_workspace)
-    pid = int(session["openocd_pid"])
+    pid = int(session["server_pid"])
     _terminate_pid(pid)
     _remove_session(resolved_workspace)
     typer.echo(f"session stopped: pid={pid}")
