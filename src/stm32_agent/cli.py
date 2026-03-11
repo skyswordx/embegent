@@ -28,6 +28,7 @@ COMMON_OPENOCD_HINTS = (
     "C:/xpack-openocd/bin/openocd.exe",
     "D:/ST/OpenOCD/bin/openocd.exe",
     "C:/ST/OpenOCD/bin/openocd.exe",
+    "D:/dap/openocd-20240916/OpenOCD-20240916-0.12.0/bin/openocd.exe",
 )
 COMMON_STLINK_GDB_SERVER_HINTS = (
     "D:/STM32CubeCLT_1.19.0/STLink-gdb-server/bin/ST-LINK_gdbserver.exe",
@@ -59,6 +60,8 @@ class ProjectConfig:
     stlink_gdb_server_args: list[str]
     serial_number: str | None
     frequency_khz: int | None
+    configure_preset: str | None
+    build_preset: str | None
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -71,7 +74,10 @@ def _read_yaml(path: Path) -> dict[str, Any]:
 
 def _load_config(config: Path | None) -> ProjectConfig:
     if config is None:
-        return ProjectConfig(None, None, None, None, None, None, None, None, None, None, None, [], None, [], None, [], None, None)
+        return ProjectConfig(
+            None, None, None, None, None, None, None, None, None, None, None, [],
+            None, [], None, [], None, None, None, None
+        )
 
     config = config.resolve()
     data = _read_yaml(config)
@@ -109,6 +115,8 @@ def _load_config(config: Path | None) -> ProjectConfig:
         stlink_gdb_server_args=[str(item) for item in data.get("stlink_gdb_server_args", [])],
         serial_number=data.get("serial_number"),
         frequency_khz=int(data["frequency_khz"]) if data.get("frequency_khz") is not None else None,
+        configure_preset=data.get("configure_preset"),
+        build_preset=data.get("build_preset"),
     )
 
 
@@ -129,6 +137,8 @@ def _merge_config(
     stlink_gdb_server_args: list[str] | None = None,
     serial_number: str | None = None,
     frequency_khz: int | None = None,
+    configure_preset: str | None = None,
+    build_preset: str | None = None,
 ) -> ProjectConfig:
     merged_workspace = workspace or config.workspace
     merged_build_dir = build_dir or config.build_dir
@@ -160,6 +170,8 @@ def _merge_config(
         ),
         serial_number=(serial_number or config.serial_number),
         frequency_khz=(frequency_khz or config.frequency_khz),
+        configure_preset=(configure_preset or config.configure_preset),
+        build_preset=(build_preset or config.build_preset),
     )
 
 
@@ -181,7 +193,15 @@ def _resolve_cfg_path(workspace: Path, cfg: str) -> str:
     candidate = Path(cfg)
     if candidate.is_absolute():
         return str(candidate)
-    return str(workspace / candidate)
+    workspace_candidate = workspace / candidate
+    if workspace_candidate.exists():
+        return str(workspace_candidate)
+    return cfg
+
+
+def _openocd_quote(value: str) -> str:
+    normalized = value.replace("\\", "/")
+    return "{" + normalized + "}"
 
 
 def _resolve_executable(name: str, env_var: str | None = None) -> str | None:
@@ -291,7 +311,8 @@ def _terminate_pid(pid: int) -> None:
 
 
 def _run_gdb_batch(gdb: str, elf: Path, gdb_port: int, commands: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
-    gdb_command = [gdb, "--quiet", str(elf)]
+    gdb_command = [gdb, "--quiet", "--batch", str(elf)]
+    gdb_command.extend(["-ex", "set confirm off"])
     gdb_command.extend(["-ex", f"target extended-remote localhost:{gdb_port}"])
     for item in commands:
         gdb_command.extend(["-ex", item])
@@ -401,6 +422,8 @@ def build(
     target: str = typer.Option("all", help="CMake build target."),
     jobs: int = typer.Option(0, min=0, help="Parallel build jobs. 0 means use CMake default."),
     generator: str | None = typer.Option(None, help="CMake generator, for example Ninja."),
+    configure_preset: str | None = typer.Option(None, help="CMake configure preset name."),
+    build_preset: str | None = typer.Option(None, help="CMake build preset name."),
     configure_arg: list[str] | None = typer.Option(None, "--configure-arg", help="Extra configure arguments."),
     configure: bool = typer.Option(True, help="Run CMake configure before building."),
     fresh: bool = typer.Option(False, help="Remove the build directory before configuring."),
@@ -413,6 +436,8 @@ def build(
         build_dir=build_dir,
         generator=generator,
         configure_args=configure_arg,
+        configure_preset=configure_preset,
+        build_preset=build_preset,
     )
     resolved_workspace = _require_path(project.workspace, "workspace is required")
     resolved_build_dir = project.build_dir or (resolved_workspace / "build")
@@ -421,6 +446,21 @@ def build(
         raise typer.BadParameter("cmake was not found. Add it to PATH or set CMAKE.")
     if not (resolved_workspace / "CMakeLists.txt").exists():
         raise typer.BadParameter(f"CMakeLists.txt not found under {resolved_workspace}")
+
+    if project.configure_preset:
+        if fresh and resolved_build_dir.exists() and not dry_run:
+            shutil.rmtree(resolved_build_dir)
+        if configure:
+            configure_command = [cmake, "--preset", project.configure_preset]
+            _run_command(configure_command, cwd=resolved_workspace, dry_run=dry_run)
+
+        build_command = [cmake, "--build", "--preset", project.build_preset or project.configure_preset]
+        if target != "all":
+            build_command.extend(["--target", target])
+        if jobs > 0:
+            build_command.extend(["-j", str(jobs)])
+        _run_command(build_command, cwd=resolved_workspace, dry_run=dry_run)
+        return
 
     if configure:
         if fresh and resolved_build_dir.exists() and not dry_run:
@@ -490,7 +530,7 @@ def flash(
             "-f",
             _resolve_cfg_path(resolved_workspace, project.target_cfg),
             "-c",
-            f"program {resolved_elf} verify reset exit",
+            f"program {_openocd_quote(str(resolved_elf))} verify reset exit",
         ]
         _run_command(command, cwd=resolved_workspace, dry_run=dry_run)
         return

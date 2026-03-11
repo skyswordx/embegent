@@ -1,0 +1,11 @@
+project_name: stm32h750vbt6
+backend: openocd
+workspace: D:/Musii-SnapShot/eediy/stm32h750vbt6
+elf: build/Debug/stm32h750vbt6.elf
+probe: stlink
+interface_cfg: interface/stlink.cfg
+target_cfg: target/stm32h7x.cfg
+configure_preset: Debug
+build_preset: Debug
+gdb_port: 3333
+openocd_args: []
