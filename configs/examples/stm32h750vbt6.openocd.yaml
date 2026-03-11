@@ -1,6 +1,6 @@
 project_name: stm32h750vbt6
 backend: openocd
-workspace: D:/Musii-SnapShot/eediy/stm32h750vbt6
+workspace: ../../workspaces/stm32h750vbt6
 elf: build/Debug/stm32h750vbt6.elf
 probe: stlink
 interface_cfg: interface/stlink.cfg

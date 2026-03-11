@@ -13,4 +13,6 @@ build/
 *.log
 tmp/
 artifacts/
-
+workspaces/*/build/
+workspaces/*/.stm32-agent/
+workspaces/*/__pycache__/
