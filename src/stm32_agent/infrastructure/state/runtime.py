@@ -7,8 +7,8 @@ from typing import Any
 
 import typer
 
-from .project import ProjectConfig
-from .state_paths import (
+from ..project import ProjectConfig
+from .paths import (
     compact_path,
     ensure_state_dirs,
     observation_file,
@@ -115,6 +115,7 @@ def build_session_state_payload(
     workspace: Path,
     current: dict[str, Any],
     *,
+    session_id: str | None = None,
     status: str | None = None,
     action: str | None = None,
     session: dict[str, Any] | None = None,
@@ -124,12 +125,12 @@ def build_session_state_payload(
     lock_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if lock_state is None:
-        from .state_lock import current_session_lock_state
+        from .lock import current_session_lock_state
 
         lock_state = current_session_lock_state(workspace)
 
     payload = {
-        "session_id": current.get("session_id") or f"{workspace.name}-{int(time.time())}",
+        "session_id": session_id or (session or {}).get("session_id") or current.get("session_id") or f"{workspace.name}-{int(time.time())}",
         "workspace": compact_path(str(workspace)),
         "backend": (session or {}).get("backend", current.get("backend")),
         "status": status or current.get("status", "unknown"),

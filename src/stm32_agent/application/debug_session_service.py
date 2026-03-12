@@ -6,9 +6,10 @@ from pathlib import Path
 
 import typer
 
-from .. import debug_support as debug_ops
-from .. import project as project_ops
-from .. import state as state_store
+from ..infrastructure import debug_support as debug_ops
+from ..infrastructure import project as project_ops
+from ..infrastructure import state as state_store
+from . import verification_service as verify_tools
 
 
 def start_debug_session(
@@ -21,10 +22,9 @@ def start_debug_session(
     gdb_port: int = 3333,
     dry_run: bool = False,
 ) -> None:
-    resolved_workspace = project_ops.require_path(project.workspace, "workspace is required")
-    resolved_elf = project_ops.require_path(project.elf, "elf is required")
-
     resolved_backend = project_ops.resolve_backend(project, backend)
+    resolved_workspace = verify_tools.prepare_workspace(project, backend=resolved_backend)
+    resolved_elf = project_ops.require_path(project.elf, "elf is required")
     interface_path = None
     target_path = None
     gdb_port_value = project.gdb_port or gdb_port
@@ -91,19 +91,12 @@ def start_debug_session(
             gdb_port_value=gdb_port_value,
         )
         state_store.write_session(resolved_workspace, payload)
-        state_store.update_project_profile(project, resolved_workspace, backend=resolved_backend)
-        state_store.update_session_state(
+        verify_tools.record_session_transition(
             resolved_workspace,
             session=payload,
+            action="debug_start",
             status="halted_or_waiting",
-            action="debug_start",
             summary=f"Debug session started with {session_kind}.",
-        )
-        state_store.append_verification(
-            resolved_workspace,
-            action="debug_start",
-            ok=True,
-            summary="Debug session started.",
             verification_status="hardware_verified",
             evidence={
                 "session_path": state_store.compact_path(str(state_store.session_file(resolved_workspace))),
@@ -121,17 +114,11 @@ def stop_debug_session(project: project_ops.ProjectConfig) -> None:
         pid = int(session["server_pid"])
         debug_ops.terminate_pid(pid)
         state_store.remove_session(resolved_workspace)
-        state_store.update_session_state(
+        verify_tools.record_session_transition(
             resolved_workspace,
             session=session,
+            action="debug_stop",
             status="stopped",
-            action="debug_stop",
-            summary=f"Debug session stopped for pid={pid}.",
-        )
-        state_store.append_verification(
-            resolved_workspace,
-            action="debug_stop",
-            ok=True,
             summary="Debug session stopped.",
             verification_status="cli_verified",
             state={"server_pid": pid},
@@ -162,7 +149,8 @@ def _spawn_debug_server(
 ) -> dict[str, object]:
     state_store.ensure_state_dirs(resolved_workspace)
     timestamp = int(time.time())
-    server_log = state_store.logs_dir(resolved_workspace) / f"openocd-{timestamp}.log"
+    session_id = f"{resolved_workspace.name}-{timestamp}"
+    server_log = state_store.logs_dir(resolved_workspace) / f"{session_kind}-{timestamp}.log"
     with server_log.open("w", encoding="utf-8") as handle:
         process = subprocess.Popen(
             command,
@@ -181,6 +169,7 @@ def _spawn_debug_server(
         raise typer.Exit(process.returncode or 1)
 
     return {
+        "session_id": session_id,
         "workspace": str(resolved_workspace),
         "elf": str(resolved_elf),
         "backend": resolved_backend,

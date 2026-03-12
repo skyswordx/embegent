@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import shutil
-from pathlib import Path
 
 import typer
 
-from .. import project as project_ops
-from .. import state as state_store
+from ..infrastructure import project as project_ops
+from ..infrastructure import state as state_store
+from . import verification_service as verify_tools
 
 
 def run_build(
@@ -18,7 +18,7 @@ def run_build(
     fresh: bool = False,
     dry_run: bool = False,
 ) -> None:
-    resolved_workspace = project_ops.require_path(project.workspace, "workspace is required")
+    resolved_workspace = verify_tools.prepare_workspace(project)
     resolved_build_dir = project.build_dir or (resolved_workspace / "build")
     cmake = project_ops.resolve_executable("cmake", "CMAKE")
     if not cmake:
@@ -27,7 +27,6 @@ def run_build(
         raise typer.BadParameter(f"CMakeLists.txt not found under {resolved_workspace}")
 
     if project.configure_preset:
-        state_store.update_project_profile(project, resolved_workspace)
         if fresh and resolved_build_dir.exists() and not dry_run:
             shutil.rmtree(resolved_build_dir)
         if configure:
@@ -50,7 +49,6 @@ def run_build(
             )
         return
 
-    state_store.update_project_profile(project, resolved_workspace)
     if configure:
         if fresh and resolved_build_dir.exists() and not dry_run:
             shutil.rmtree(resolved_build_dir)

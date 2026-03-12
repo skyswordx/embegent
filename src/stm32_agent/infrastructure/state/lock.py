@@ -9,7 +9,7 @@ from typing import Any, Iterator
 
 import typer
 
-from .state_paths import (
+from .paths import (
     ensure_state_dirs,
     read_json,
     session_lock_dir,
@@ -17,7 +17,7 @@ from .state_paths import (
     session_state_file,
     write_json,
 )
-from .state_runtime import build_session_state_payload
+from .runtime import build_session_state_payload
 
 
 def read_session_lock(workspace: Path) -> dict[str, Any]:

@@ -39,8 +39,17 @@ def extract_registers(text: str) -> dict[str, str]:
 
 
 def extract_backtrace_lines(text: str, limit: int = 5) -> list[str]:
-    frames = [line.strip() for line in text.splitlines() if line.strip().startswith("#")]
-    return frames[:limit]
+    frames: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("#"):
+            continue
+        if frames and frames[-1] == stripped:
+            continue
+        frames.append(stripped)
+        if len(frames) >= limit:
+            break
+    return frames
 
 
 def trim_lines(text: str, limit: int = 20) -> list[str]:

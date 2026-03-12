@@ -6,9 +6,10 @@ from typing import Any, Iterator
 
 import typer
 
-from .. import debug_support as debug_ops
-from .. import project as project_ops
-from .. import state as state_store
+from ..infrastructure import debug_support as debug_ops
+from ..infrastructure import project as project_ops
+from ..infrastructure import state as state_store
+from . import verification_service as verify_tools
 
 
 @contextmanager
@@ -134,22 +135,16 @@ def _record_halted_capture(
     verification_evidence: dict[str, Any] | None = None,
     verification_state: dict[str, Any] | None = None,
 ) -> None:
-    state_store.update_session_state(
+    verify_tools.record_session_transition(
         resolved_workspace,
         session=session,
+        action=action,
         status="halted",
-        action=action,
-        source=source,
-        registers=registers,
-        summary=summary,
-    )
-    state_store.append_observation(resolved_workspace, observation)
-    state_store.append_verification(
-        resolved_workspace,
-        action=action,
-        ok=True,
         summary=summary,
         verification_status="hardware_verified",
+        source=source,
+        registers=registers,
+        observation=observation,
         evidence=verification_evidence,
         state=verification_state,
     )

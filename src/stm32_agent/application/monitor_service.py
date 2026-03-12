@@ -6,8 +6,9 @@ from pathlib import Path
 import serial
 import typer
 
-from .. import project as project_ops
-from .. import state as state_store
+from ..infrastructure import project as project_ops
+from ..infrastructure import state as state_store
+from . import verification_service as verify_tools
 
 
 def run_monitor(
@@ -19,8 +20,7 @@ def run_monitor(
     log_file: Path | None = None,
     raw: bool = False,
 ) -> None:
-    resolved_workspace = project_ops.require_path(project.workspace, "workspace is required")
-    state_store.update_project_profile(project, resolved_workspace)
+    resolved_workspace = verify_tools.prepare_workspace(project)
     port = serial_port or project.serial_port
     if not port:
         raise typer.BadParameter("serial_port is required")
@@ -67,6 +67,17 @@ def run_monitor(
                         "log_file": state_store.compact_path(str(resolved_log_file)) if resolved_log_file else None,
                     },
                 )
+        verify_tools.record_verification(
+            resolved_workspace,
+            action="monitor",
+            ok=True,
+            summary=f"Monitor session completed on {port}.",
+            verification_status="hardware_verified",
+            evidence={
+                "log_file": state_store.compact_path(str(resolved_log_file)) if resolved_log_file else None,
+            },
+            state={"port": port, "baudrate": resolved_baudrate},
+        )
     except KeyboardInterrupt:
         typer.echo("monitor interrupted")
     except serial.SerialException as exc:

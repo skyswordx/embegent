@@ -7,12 +7,13 @@ from typing import Any
 
 import typer
 
-from ..app import context as app_context
-from .. import debug_support as debug_ops
-from .. import project as project_ops
-from .. import state as state_store
-from .. import svd as svd_ops
-from .debug_actions import locked_session
+from ..agent import context as app_context
+from ..infrastructure import debug_support as debug_ops
+from ..infrastructure import project as project_ops
+from ..infrastructure import state as state_store
+from ..infrastructure import svd as svd_ops
+from .debug_actions_service import locked_session
+from . import verification_service as verify_tools
 
 
 def emit_snapshot(
@@ -27,6 +28,7 @@ def emit_snapshot(
         raise typer.BadParameter("At most 3 --watch targets are supported per snapshot.")
 
     resolved_workspace = project_ops.require_path(project.workspace, "workspace is required")
+    payload: dict[str, Any]
     with state_store.session_command_lock(resolved_workspace, action="debug_snapshot"):
         agent_context = app_context.build_agent_context(resolved_workspace, observation_limit=observation_limit)
         payload = debug_ops.collect_snapshot_payload(
@@ -43,31 +45,22 @@ def emit_snapshot(
             session = state_store.read_session(resolved_workspace)
             source = payload.get("current_location") or {}
             registers = payload.get("registers_compact") or {}
-            state_store.update_session_state(
+            verify_tools.record_session_transition(
                 resolved_workspace,
                 session=session,
-                status="halted",
                 action="debug_snapshot",
+                status="halted",
+                summary=f"Snapshot captured at {source.get('symbol', 'unknown location')}.",
+                verification_status="hardware_verified",
                 source=source if isinstance(source, dict) else None,
                 registers=registers if isinstance(registers, dict) else None,
-                summary=f"Snapshot captured at {source.get('symbol', 'unknown location')}.",
-            )
-            state_store.append_observation(
-                resolved_workspace,
-                {
+                observation={
                     "kind": "snapshot",
                     "source": source,
                     "registers_compact": registers,
                     "summary": f"Snapshot captured with {len(payload.get('peripheral_summary', []))} peripheral summary item(s).",
                     "raw_excerpt": payload.get("top_backtrace", []),
                 },
-            )
-            state_store.append_verification(
-                resolved_workspace,
-                action="debug_snapshot",
-                ok=True,
-                summary=f"Snapshot captured at {source.get('symbol', 'unknown location')}.",
-                verification_status="hardware_verified",
                 state={
                     "source": source,
                     "watch_count": len(watch),
@@ -75,14 +68,21 @@ def emit_snapshot(
                 },
             )
             payload["captured_at"] = int(time.time())
-            payload["session_state"] = state_store.read_session_state(resolved_workspace)
-            payload["recent_observations"] = state_store.recent_observations(
-                resolved_workspace,
-                limit=observation_limit,
-            )
-            payload["verification"] = state_store.latest_verification_entry(resolved_workspace)
 
-        typer.echo(json.dumps(payload, indent=2, ensure_ascii=False))
+    refreshed_context = app_context.build_agent_context(
+        resolved_workspace,
+        observation_limit=observation_limit,
+    )
+    payload["session_state"] = refreshed_context["session_state"]
+    payload["recent_observations"] = refreshed_context["recent_observations"]
+    payload["verification"] = refreshed_context["latest_verification"]
+    payload["agent_context"] = {
+        "runtime": refreshed_context["runtime"],
+        "recommended_actions": refreshed_context["recommended_actions"],
+        "state_files": refreshed_context["state_files"],
+    }
+
+    typer.echo(json.dumps(payload, indent=2, ensure_ascii=False))
 
 
 def read_peripheral(
@@ -123,28 +123,19 @@ def read_peripheral(
                 for item in decoded
             ],
         }
-        state_store.update_session_state(
+        verify_tools.record_session_transition(
             resolved_workspace,
             session=session,
-            status="halted",
             action="debug_peripheral_read",
+            status="halted",
             summary=summary,
-        )
-        state_store.append_observation(
-            resolved_workspace,
-            {
+            verification_status="hardware_verified",
+            observation={
                 "kind": "peripheral_read",
                 "peripheral": peripheral_name,
                 "svd_path": state_store.compact_path(str(resolved_svd_path)),
                 "decoded": decoded,
             },
-        )
-        state_store.append_verification(
-            resolved_workspace,
-            action="debug_peripheral_read",
-            ok=True,
-            summary=summary,
-            verification_status="hardware_verified",
             evidence={"svd_path": state_store.compact_path(str(resolved_svd_path))},
             state=compact,
         )

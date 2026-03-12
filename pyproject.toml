@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.scripts]
-stm32-agent = "stm32_agent.cli:app"
+stm32-agent = "stm32_agent.interfaces.cli:app"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

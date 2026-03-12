@@ -1,4 +1,4 @@
-from .state_lock import (
+from .lock import (
     clear_session_lock,
     current_session_lock_state,
     read_session_lock,
@@ -8,7 +8,7 @@ from .state_lock import (
     session_lock_file,
     write_session_lock_state,
 )
-from .state_paths import (
+from .paths import (
     compact_path,
     ensure_state_dirs,
     logs_dir,
@@ -22,7 +22,7 @@ from .state_paths import (
     verification_report_file,
     write_json,
 )
-from .state_runtime import (
+from .runtime import (
     append_observation,
     append_verification,
     compact_observation_event,

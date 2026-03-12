@@ -4,8 +4,9 @@ from pathlib import Path
 
 import typer
 
-from .. import project as project_ops
-from .. import state as state_store
+from ..infrastructure import project as project_ops
+from ..infrastructure import state as state_store
+from . import verification_service as verify_tools
 
 
 def run_flash(
@@ -16,10 +17,9 @@ def run_flash(
     cubeprogrammer_path: str | None = None,
     dry_run: bool = False,
 ) -> None:
-    resolved_workspace = project_ops.require_path(project.workspace, "workspace is required")
+    resolved_workspace = verify_tools.prepare_workspace(project, backend=project_ops.resolve_backend(project, backend))
     resolved_elf = project_ops.require_path(project.elf, "elf is required")
     resolved_backend = project_ops.resolve_backend(project, backend)
-    state_store.update_project_profile(project, resolved_workspace, backend=resolved_backend)
     if not resolved_elf.exists() and not dry_run:
         raise typer.BadParameter(f"ELF not found: {resolved_elf}")
 
