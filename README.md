@@ -49,6 +49,21 @@
 
 当前阶段是 `CLI MVP`，已经不是空壳。
 
+在代码组织上，当前也已经完成第一轮重构：
+
+- `cli.py` 负责命令编排
+- `project.py` 负责配置与执行基础设施
+- `state.py` 负责结构化证据落盘
+- `svd.py` 负责 SVD 拉取与解析
+- `debug_support.py` 负责 GDB 与调试快照辅助
+- `tools/build.py` 负责构建命令实现
+- `tools/flash.py` 负责烧录命令实现
+- `tools/debug.py` 负责调试命令实现
+- `tools/monitor.py` 负责串口监视命令实现
+- `tools/svd.py` 负责 SVD 拉取命令实现
+- `tools/verify.py` 负责验证记录公共能力
+- `app/context.py` 负责组装面向 Agent 的结构化上下文
+
 已具备的命令：
 
 | 环境检查 | 构建 | 烧录 | 监视 | 获取 SVD | 启动调试 | 停止调试 | 单步执行 | 继续执行 | 读取寄存器 | 查看回溯 | 生成快照 | 读取外设寄存器 |
@@ -163,7 +178,7 @@ flowchart TD
 
 这层的职责是和真实工具对接，而不是把工具能力重新发明一遍。
 
-从长期演进看，这一层更适合继续拆成独立工具模块：
+当前第二轮下沉已经开始把执行逻辑继续收口到 `src/stm32_agent/tools/`：
 
 - `build`
 - `flash`
@@ -172,7 +187,18 @@ flowchart TD
 - `svd`
 - `verify`
 
+当前已经落地的是 `tools/build.py`、`tools/flash.py`、`tools/debug.py`、`tools/monitor.py`、`tools/svd.py`，并补了 `tools/verify.py` 作为验证记录的公共入口。
+
 这样主循环只负责调度，具体执行和异常处理都留在工具层。
+
+同时，当前调试命令已经引入“会话级串行化”保护：
+
+- `debug start / stop / step / continue / registers / backtrace / snapshot / peripheral-read`
+- 这些命令共享同一把会话锁
+- 如果 Agent 或外部客户端错误地并行调度这些命令，它们会排队或返回“session busy”，而不是互相踩掉 `session.json`
+- `flash` 也会在活动调试会话存在时拒绝执行，避免烧录和调试 session 抢同一套硬件资源
+
+这层保护的目标不是让 Agent “更聪明”，而是让执行层即使面对不合理调度，也尽量保持状态一致性。
 
 ### 4. 结构化证据层
 
@@ -285,6 +311,7 @@ CLI、MCP、JSON-RPC、VS Code 集成都不应该反过来塑造核心业务结�
 - 当前源码位置
 - 最近一次命令
 - 调试后端状态
+- 当前会话锁状态，例如 `busy / idle`、占用动作、锁持有时长
 
 ### `observation.json`
 
@@ -393,12 +420,12 @@ stm32-agent debug stop
 
 ## 项目结构
 
-当前仓库组织建议按下面理解：
+当前仓库组织可以按下面理解：
 
 ```text
 embegent/
   configs/examples/          示例配置
-  src/stm32_agent/           CLI 与调试链路实现
+  src/stm32_agent/           CLI、工具层与状态模型
   tests/                     最小测试与夹具
   workspaces/stm32h750vbt6/  真机验证样例工程
 ```
@@ -406,7 +433,29 @@ embegent/
 职责边界如下：
 
 - `src/stm32_agent/cli.py`
-  当前 MVP 主入口，承担命令编排、后端调用、上下文落盘
+  当前命令行编排入口，主要负责参数接收、流程调度和结果输出
+- `src/stm32_agent/project.py`
+  配置模型、可执行文件发现、后端解析、通用命令执行
+- `src/stm32_agent/state.py`
+  `.stm32-agent/` 目录下的结构化状态与证据读写
+- `src/stm32_agent/svd.py`
+  CMSIS-SVD 拉取、解析、外设寄存器元数据处理
+- `src/stm32_agent/debug_support.py`
+  GDB 批处理、调试会话辅助、快照采集和寄存器/回溯摘要
+- `src/stm32_agent/tools/build.py`
+  `build` 命令的实际执行实现
+- `src/stm32_agent/tools/flash.py`
+  `flash` 命令的实际执行实现
+- `src/stm32_agent/tools/debug.py`
+  `debug start / stop / step / continue / snapshot / peripheral-read` 的实际执行实现
+- `src/stm32_agent/tools/monitor.py`
+  `monitor` 命令的实际执行实现
+- `src/stm32_agent/tools/svd.py`
+  `svd fetch` 命令的实际执行实现
+- `src/stm32_agent/tools/verify.py`
+  结构化验证记录的公共工具入口
+- `src/stm32_agent/app/context.py`
+  面向 Agent 的上下文聚合入口，统一读取 `project_profile / session_state / observation / verification`
 - `configs/examples/`
   让外部用户快速复用工程配置，而不是硬编码路径
 - `workspaces/`
@@ -414,7 +463,13 @@ embegent/
 - `.stm32-agent/`
   运行时状态目录，默认不入库
 
-如果后续继续往理想架构演进，更推荐的内部组织会接近这样：
+这意味着当前代码已经从“巨型单文件脚本”走到了“两层拆分”：
+
+- 第一层是 `cli.py -> project.py / state.py / svd.py / debug_support.py`
+- 第二层是 `cli.py -> tools/build.py / tools/flash.py / tools/debug.py / tools/monitor.py / tools/svd.py`
+- 第三层开始出现 `app/context.py` 这种 Agent 入口服务，用来把状态层拼成稳定的消费接口
+
+如果后续继续往理想架构演进，更推荐的内部组织会进一步靠近这样：
 
 ```text
 src/stm32_agent/
@@ -424,7 +479,7 @@ src/stm32_agent/
   adapters/      cli / mcp / jsonrpc / vscode
 ```
 
-当前还没有完全拆到这个粒度，但这是后续整理代码结构时更值得靠近的方向。
+当前还没有完全拆到这个目录粒度，但职责边界已经开始按这个方向收口，这是后续继续整理代码结构时更值得靠近的路线。
 
 ## 人工验收建议
 
