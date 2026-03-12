@@ -9,7 +9,6 @@ from typing import Any
 
 import typer
 
-from .app import context as app_context
 from . import project as project_ops
 from . import state as state_store
 from . import svd as svd_ops
@@ -217,8 +216,9 @@ def collect_snapshot_payload(
     backtrace_limit: int,
     observation_limit: int,
     svd_path: Path | None = None,
+    agent_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    agent_context = app_context.build_agent_context(workspace, observation_limit=observation_limit)
+    context_payload = agent_context or {}
     payload: dict[str, Any] = {
         "workspace": state_store.compact_path(str(workspace)),
         "captured_at": int(time.time()),
@@ -227,9 +227,9 @@ def collect_snapshot_payload(
         "registers_compact": {},
         "top_backtrace": [],
         "peripheral_summary": [],
-        "session_state": agent_context.get("session_state", {}),
-        "recent_observations": agent_context.get("recent_observations", []),
-        "verification": agent_context.get("latest_verification", {}),
+        "session_state": context_payload.get("session_state", {}),
+        "recent_observations": context_payload.get("recent_observations", []),
+        "verification": context_payload.get("latest_verification", {}),
     }
 
     session_path = state_store.session_file(workspace)

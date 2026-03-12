@@ -52,12 +52,12 @@ The codebase has already completed the first restructuring round:
 
 - `cli.py` handles command entry and orchestration
 - `project.py` handles config, backend resolution, and process execution
-- `state.py` persists structured state and evidence
+- `state.py` remains a compatibility surface, while the implementation is now split into `state_paths.py / state_lock.py / state_runtime.py`
 - `svd.py` handles SVD fetching and parsing
 - `debug_support.py` handles GDB helpers and snapshot collection
 - `tools/build.py` implements build execution
 - `tools/flash.py` implements flash execution
-- `tools/debug.py` implements debug execution
+- `tools/debug.py` remains a compatibility surface, while the implementation is now split into `debug_session.py / debug_actions.py / debug_snapshot.py`
 - `tools/monitor.py` implements serial monitor execution
 - `tools/svd.py` implements SVD fetch execution
 - `tools/verify.py` provides shared verification-record helpers
@@ -201,6 +201,12 @@ What already exists today:
 - `tools/svd.py`
 - `tools/verify.py`
 
+Inside the debug area, `tools/debug.py` now only re-exports the public entry points. The actual responsibilities are separated into:
+
+- `debug_session.py`
+- `debug_actions.py`
+- `debug_snapshot.py`
+
 The debug layer now also includes session-level serialization:
 
 - `debug start / stop / step / continue / registers / backtrace / snapshot / peripheral-read`
@@ -225,6 +231,8 @@ The goal is to spend context where it matters:
 - session state stays compact
 - dynamic observation keeps only the recent window
 - every validation result is tied to evidence
+
+The `session_state.json` payload is now also built through a single shared path, so lock updates and debug-state updates do not drift apart under concurrent command scheduling.
 
 ## Ideal Agent Architecture
 
@@ -445,7 +453,7 @@ Current responsibilities:
 - `src/stm32_agent/tools/flash.py`
   flash command implementation
 - `src/stm32_agent/tools/debug.py`
-  debug start, stop, step, continue, snapshot, and peripheral-read implementations
+  compatibility entry for debug capabilities, internally split into `debug_session / debug_actions / debug_snapshot`
 - `src/stm32_agent/tools/monitor.py`
   monitor command implementation
 - `src/stm32_agent/tools/svd.py`

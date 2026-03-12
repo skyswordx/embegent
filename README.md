@@ -53,12 +53,12 @@
 
 - `cli.py` 负责命令编排
 - `project.py` 负责配置与执行基础设施
-- `state.py` 负责结构化证据落盘
+- `state.py` 作为兼容入口，内部继续拆到 `state_paths.py / state_lock.py / state_runtime.py`
 - `svd.py` 负责 SVD 拉取与解析
 - `debug_support.py` 负责 GDB 与调试快照辅助
 - `tools/build.py` 负责构建命令实现
 - `tools/flash.py` 负责烧录命令实现
-- `tools/debug.py` 负责调试命令实现
+- `tools/debug.py` 作为兼容入口，内部继续拆到 `debug_session.py / debug_actions.py / debug_snapshot.py`
 - `tools/monitor.py` 负责串口监视命令实现
 - `tools/svd.py` 负责 SVD 拉取命令实现
 - `tools/verify.py` 负责验证记录公共能力
@@ -189,6 +189,12 @@ flowchart TD
 
 当前已经落地的是 `tools/build.py`、`tools/flash.py`、`tools/debug.py`、`tools/monitor.py`、`tools/svd.py`，并补了 `tools/verify.py` 作为验证记录的公共入口。
 
+其中 `tools/debug.py` 现在只保留兼容导出，具体职责已经下沉到：
+
+- `debug_session.py`
+- `debug_actions.py`
+- `debug_snapshot.py`
+
 这样主循环只负责调度，具体执行和异常处理都留在工具层。
 
 同时，当前调试命令已经引入“会话级串行化”保护：
@@ -219,6 +225,8 @@ flowchart TD
 - 验证结论必须附带证据
 
 这一层的意义，是把“调试信息”变成“Agent 可消费、也能被人类复核”的调试上下文，而不是单纯写几份 JSON。
+
+当前 `session_state.json` 的生成也已经收敛到统一的 payload 组装逻辑，锁状态更新和调试状态更新不再各写一套字段，避免状态文件在并发场景里出现格式漂移。
 
 ## 理想的 Agent 架构
 
@@ -447,7 +455,7 @@ embegent/
 - `src/stm32_agent/tools/flash.py`
   `flash` 命令的实际执行实现
 - `src/stm32_agent/tools/debug.py`
-  `debug start / stop / step / continue / snapshot / peripheral-read` 的实际执行实现
+  `debug` 能力的兼容入口，内部继续拆到 `debug_session / debug_actions / debug_snapshot`
 - `src/stm32_agent/tools/monitor.py`
   `monitor` 命令的实际执行实现
 - `src/stm32_agent/tools/svd.py`
