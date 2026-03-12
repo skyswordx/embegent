@@ -600,8 +600,19 @@ def _load_svd_peripheral(svd_path: Path, peripheral_name: str) -> tuple[str, int
     return target_name, base_address, registers
 
 
-def _read_memory_word(project: ProjectConfig, workspace: Path, address: int) -> tuple[int, str]:
-    completed = _session_gdb_command(project, ["monitor halt", f"x/1wx 0x{address:08x}"], workspace=workspace)
+def _read_memory_word(
+    project: ProjectConfig,
+    workspace: Path,
+    address: int,
+    *,
+    echo_output: bool = True,
+) -> tuple[int, str]:
+    completed = _session_gdb_command(
+        project,
+        ["monitor halt", f"x/1wx 0x{address:08x}"],
+        workspace=workspace,
+        echo_output=echo_output,
+    )
     pattern = re.compile(r"0x[0-9a-fA-F]+:\s+0x([0-9a-fA-F]+)")
     match = pattern.search(completed.stdout)
     if not match:
@@ -800,6 +811,7 @@ def _read_peripheral_snapshot(
     *,
     watch_specs: list[str],
     svd_path: Path | None = None,
+    echo_output: bool = True,
 ) -> list[dict[str, Any]]:
     if not watch_specs:
         return []
@@ -822,7 +834,7 @@ def _read_peripheral_snapshot(
 
         for item in selected[:1]:
             address = base_address + item.address_offset
-            value, _ = _read_memory_word(project, workspace, address)
+            value, _ = _read_memory_word(project, workspace, address, echo_output=echo_output)
             fields = _summarize_register_fields(item, value)
             decoded.append(
                 {
@@ -870,6 +882,7 @@ def _collect_snapshot_payload(
         project,
         ["monitor halt", "frame", "info registers sp lr pc control", "bt"],
         workspace=workspace,
+        echo_output=False,
     )
     source = _extract_source_location(completed.stdout)
     registers = _extract_registers(completed.stdout)
@@ -879,6 +892,7 @@ def _collect_snapshot_payload(
         workspace,
         watch_specs=watch_specs,
         svd_path=svd_path,
+        echo_output=False,
     )
 
     payload.update(
@@ -995,7 +1009,15 @@ def _terminate_pid(pid: int) -> None:
         os.kill(pid, 15)
 
 
-def _run_gdb_batch(gdb: str, elf: Path, gdb_port: int, commands: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+def _run_gdb_batch(
+    gdb: str,
+    elf: Path,
+    gdb_port: int,
+    commands: list[str],
+    cwd: Path | None = None,
+    *,
+    echo_output: bool = True,
+) -> subprocess.CompletedProcess[str]:
     gdb_command = [gdb, "--quiet", "--batch", str(elf)]
     gdb_command.extend(["-ex", "set confirm off"])
     gdb_command.extend(["-ex", f"target extended-remote localhost:{gdb_port}"])
@@ -1010,13 +1032,13 @@ def _run_gdb_batch(gdb: str, elf: Path, gdb_port: int, commands: list[str], cwd:
         encoding="utf-8",
         errors="replace",
     )
-    if completed.stdout:
+    if echo_output and completed.stdout:
         _safe_echo(completed.stdout.rstrip())
     if completed.returncode != 0:
-        if completed.stderr:
+        if echo_output and completed.stderr:
             _safe_echo(completed.stderr.rstrip(), err=True)
         raise typer.Exit(completed.returncode)
-    if completed.stderr:
+    if echo_output and completed.stderr:
         _safe_echo(completed.stderr.rstrip(), err=True)
     return completed
 
@@ -1038,6 +1060,7 @@ def _session_gdb_command(
     commands: list[str],
     *,
     workspace: Path | None = None,
+    echo_output: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     resolved_workspace, session = _resolve_session(project, workspace)
     return _run_gdb_batch(
@@ -1046,6 +1069,7 @@ def _session_gdb_command(
         int(session["gdb_port"]),
         commands,
         cwd=resolved_workspace,
+        echo_output=echo_output,
     )
 
 
@@ -1778,6 +1802,7 @@ def debug_snapshot(
                 "observation_count": len(payload.get("recent_observations", [])),
             },
         )
+        payload["verification"] = _latest_verification_entry(resolved_workspace)
 
     typer.echo(json.dumps(payload, indent=2, ensure_ascii=False))
 
