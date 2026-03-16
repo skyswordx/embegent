@@ -6,10 +6,19 @@ from pathlib import Path
 
 import typer
 
-from ..infrastructure import debug_support as debug_ops
-from ..infrastructure import project as project_ops
-from ..infrastructure import state as state_store
-from . import verification_service as verify_tools
+from ...contracts import DebugCommandResult
+from ...infrastructure.debug import gdb as debug_ops
+from ...infrastructure import project as project_ops
+from ...infrastructure import state as state_store
+from .. import verification as verify_tools
+
+
+class DebugServerStartupError(Exception):
+    def __init__(self, *, returncode: int, log_path: str, log_text: str) -> None:
+        super().__init__(f"debug server exited early with code {returncode}")
+        self.returncode = returncode
+        self.log_path = log_path
+        self.log_text = log_text
 
 
 def start_debug_session(
@@ -21,7 +30,7 @@ def start_debug_session(
     cubeprogrammer_path: str | None = None,
     gdb_port: int = 3333,
     dry_run: bool = False,
-) -> None:
+) -> DebugCommandResult:
     resolved_backend = project_ops.resolve_backend(project, backend)
     resolved_workspace = verify_tools.prepare_workspace(project, backend=resolved_backend)
     resolved_elf = project_ops.require_path(project.elf, "elf is required")
@@ -70,9 +79,13 @@ def start_debug_session(
     else:
         raise typer.BadParameter(f"Unsupported backend: {resolved_backend}")
 
-    typer.echo("$ " + " ".join(command))
     if dry_run:
-        return
+        return DebugCommandResult(
+            summary=f"Dry-run: {session_kind} start command prepared.",
+            command=command,
+            backend=resolved_backend,
+            payload={"gdb_port": gdb_port_value, "session_kind": session_kind, "dry_run": True},
+        )
 
     with state_store.session_command_lock(resolved_workspace, action="debug_start"):
         session_path = state_store.session_file(resolved_workspace)
@@ -104,10 +117,17 @@ def start_debug_session(
             },
             state={"backend": resolved_backend, "server_kind": session_kind},
         )
-        typer.echo(f"session started: {session_path}")
+        return DebugCommandResult(
+            summary=f"Session started: {state_store.compact_path(str(session_path))}",
+            command=command,
+            session_path=state_store.compact_path(str(session_path)),
+            pid=int(payload["server_pid"]),
+            backend=resolved_backend,
+            payload=dict(payload),
+        )
 
 
-def stop_debug_session(project: project_ops.ProjectConfig) -> None:
+def stop_debug_session(project: project_ops.ProjectConfig) -> DebugCommandResult:
     resolved_workspace = project_ops.require_path(project.workspace, "workspace is required")
     with state_store.session_command_lock(resolved_workspace, action="debug_stop"):
         session = state_store.read_session(resolved_workspace)
@@ -123,7 +143,12 @@ def stop_debug_session(project: project_ops.ProjectConfig) -> None:
             verification_status="cli_verified",
             state={"server_pid": pid},
         )
-        typer.echo(f"session stopped: pid={pid}")
+        return DebugCommandResult(
+            summary=f"Session stopped: pid={pid}",
+            pid=pid,
+            backend=str(session.get("backend") or ""),
+            payload={"session_id": session.get("session_id"), "server_kind": session.get("server_kind")},
+        )
 
 
 def _resolve_cubeprogrammer_dir(cubeprogrammer_path: str | None) -> str | None:
@@ -165,8 +190,11 @@ def _spawn_debug_server(
     time.sleep(1.0)
     if process.poll() is not None:
         log_text = server_log.read_text(encoding="utf-8", errors="replace") if server_log.exists() else ""
-        typer.echo(log_text.rstrip(), err=True)
-        raise typer.Exit(process.returncode or 1)
+        raise DebugServerStartupError(
+            returncode=process.returncode or 1,
+            log_path=state_store.compact_path(str(server_log)) or str(server_log),
+            log_text=log_text,
+        )
 
     return {
         "session_id": session_id,

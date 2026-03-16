@@ -4,27 +4,22 @@ from pathlib import Path
 
 import typer
 
-from ..application import build_service as build_tools
-from ..application import debug_actions_service
-from ..application import debug_session_service
-from ..application import debug_snapshot_service
-from ..application import flash_service as flash_tools
-from ..application import monitor_service as monitor_tools
-from ..infrastructure import project as project_ops
-from ..infrastructure import svd as svd_ops
+from ..application import build as build_tools
+from ..application import doctor as doctor_tools
+from ..application.debug import control as debug_actions_app
+from ..application.debug import session as debug_session_app
+from ..application.debug import snapshot as debug_snapshot_app
+from ..application import flash as flash_tools
+from ..application import monitor as monitor_tools
+from ..application import projects as project_app
+from ..application import svd as svd_tools
+from . import render as renderers
 
 app = typer.Typer(help="STM32 AI debug-chain CLI prototype.")
 debug_app = typer.Typer(help="Debug-related commands.")
 svd_app = typer.Typer(help="CMSIS-SVD related commands.")
 app.add_typer(debug_app, name="debug")
 app.add_typer(svd_app, name="svd")
-
-
-def _resolve_project(
-    config: Path | None,
-    **overrides: object,
-) -> project_ops.ProjectConfig:
-    return project_ops.merge_config(project_ops.load_config(config), **overrides)
 
 
 @svd_app.command("fetch")
@@ -35,10 +30,13 @@ def svd_fetch(
     force: bool = typer.Option(False, help="Overwrite existing local SVD file."),
 ) -> None:
     """Fetch an STM32 CMSIS-SVD file from modm-io/cmsis-svd-stm32."""
-    result = svd_ops.fetch_svd(chip=chip, workspace=workspace or Path.cwd(), output=output, force=force)
-    typer.echo(
-        f"SVD {'reused' if result['reused'] else 'fetched'}: {result['candidate_name']} -> {result['local_path']}"
+    result = svd_tools.fetch_svd_file(
+        chip=chip,
+        workspace=workspace or Path.cwd(),
+        output=output,
+        force=force,
     )
+    renderers.render_svd_fetch(result)
 
 
 @app.command()
@@ -46,16 +44,9 @@ def doctor(
     config: Path | None = typer.Option(None, "--config", "-c", help="Path to a YAML project config."),
 ) -> None:
     """Check required tools and project paths."""
-    project = project_ops.load_config(config)
-    typer.echo(f"{'backend':18} {project_ops.resolve_backend(project)}")
-    ok = True
-    required_keys = project_ops.doctor_required_keys(project)
-    for name, result in project_ops.doctor_checks(project):
-        typer.echo(f"{name:18} {result}")
-        if name in required_keys and (result == "MISSING" or result.startswith("MISSING:")):
-            ok = False
-
-    if not ok:
+    result = doctor_tools.run_doctor(project_app.load_project(config))
+    renderers.render_doctor(result)
+    if not result.ok:
         raise typer.Exit(1)
 
 
@@ -75,7 +66,7 @@ def build(
     dry_run: bool = typer.Option(False, help="Print commands only."),
 ) -> None:
     """Build the current STM32 project with CMake."""
-    project = _resolve_project(
+    project = project_app.resolve_project(
         config,
         workspace=workspace,
         build_dir=build_dir,
@@ -84,7 +75,7 @@ def build(
         configure_preset=configure_preset,
         build_preset=build_preset,
     )
-    build_tools.run_build(
+    result = build_tools.run_build(
         project,
         target=target,
         jobs=jobs,
@@ -92,6 +83,7 @@ def build(
         fresh=fresh,
         dry_run=dry_run,
     )
+    renderers.render_build_result(result)
 
 
 @app.command()
@@ -111,7 +103,7 @@ def flash(
     dry_run: bool = typer.Option(False, help="Print commands only."),
 ) -> None:
     """Flash ELF to target board."""
-    project = _resolve_project(
+    project = project_app.resolve_project(
         config,
         workspace=workspace,
         elf=elf,
@@ -122,13 +114,14 @@ def flash(
         serial_number=serial_number,
         frequency_khz=frequency_khz,
     )
-    flash_tools.run_flash(
+    result = flash_tools.run_flash(
         project,
         backend=backend,
         openocd_path=openocd_path,
         cubeprogrammer_path=cubeprogrammer_path,
         dry_run=dry_run,
     )
+    renderers.render_flash_result(result)
 
 
 @app.command()
@@ -142,15 +135,17 @@ def monitor(
     raw: bool = typer.Option(False, help="Do not prefix lines with timestamps."),
 ) -> None:
     """Stream serial monitor output to stdout and optionally a log file."""
-    project = _resolve_project(config, workspace=workspace)
-    monitor_tools.run_monitor(
+    project = project_app.resolve_project(config, workspace=workspace)
+    result = monitor_tools.run_monitor(
         project,
         serial_port=serial_port,
         baudrate=baudrate,
         duration=duration,
         log_file=log_file,
         raw=raw,
+        on_event=renderers.render_monitor_event,
     )
+    renderers.render_monitor_result(result)
 
 
 @debug_app.command("start")
@@ -171,7 +166,7 @@ def debug_start(
     dry_run: bool = typer.Option(False, help="Print commands only."),
 ) -> None:
     """Start a debug session."""
-    project = _resolve_project(
+    project = project_app.resolve_project(
         config,
         workspace=workspace,
         elf=elf,
@@ -183,15 +178,20 @@ def debug_start(
         serial_number=serial_number,
         frequency_khz=frequency_khz,
     )
-    debug_session_service.start_debug_session(
-        project,
-        backend=backend,
-        openocd_path=openocd_path,
-        stlink_gdb_server_path=stlink_gdb_server_path,
-        cubeprogrammer_path=cubeprogrammer_path,
-        gdb_port=gdb_port,
-        dry_run=dry_run,
-    )
+    try:
+        result = debug_session_app.start_debug_session(
+            project,
+            backend=backend,
+            openocd_path=openocd_path,
+            stlink_gdb_server_path=stlink_gdb_server_path,
+            cubeprogrammer_path=cubeprogrammer_path,
+            gdb_port=gdb_port,
+            dry_run=dry_run,
+        )
+    except debug_session_app.DebugServerStartupError as error:
+        renderers.render_debug_startup_error(error)
+        raise typer.Exit(error.returncode)
+    renderers.render_debug_command(result)
 
 
 @debug_app.command("stop")
@@ -200,8 +200,8 @@ def debug_stop(
     workspace: Path | None = typer.Option(None, help="STM32 project root."),
 ) -> None:
     """Stop the current debug session."""
-    project = _resolve_project(config, workspace=workspace)
-    debug_session_service.stop_debug_session(project)
+    project = project_app.resolve_project(config, workspace=workspace)
+    renderers.render_debug_command(debug_session_app.stop_debug_session(project))
 
 
 @debug_app.command("step")
@@ -211,8 +211,8 @@ def debug_step(
     instruction: bool = typer.Option(True, "--instruction/--source", help="Use stepi or step."),
 ) -> None:
     """Perform one debug step."""
-    project = _resolve_project(config, workspace=workspace)
-    debug_actions_service.step_debug_session(project, instruction=instruction)
+    project = project_app.resolve_project(config, workspace=workspace)
+    debug_actions_app.step_debug_session(project, instruction=instruction)
 
 
 @debug_app.command("continue")
@@ -222,8 +222,8 @@ def debug_continue(
     address: str | None = typer.Option(None, help="Optional resume address, for example 0x08000100."),
 ) -> None:
     """Continue the current debug session."""
-    project = _resolve_project(config, workspace=workspace)
-    debug_actions_service.continue_debug_session(project, address=address)
+    project = project_app.resolve_project(config, workspace=workspace)
+    renderers.render_debug_command(debug_actions_app.continue_debug_session(project, address=address))
 
 
 @debug_app.command("registers")
@@ -232,8 +232,8 @@ def debug_registers(
     workspace: Path | None = typer.Option(None, help="STM32 project root."),
 ) -> None:
     """Dump registers from the current debug session."""
-    project = _resolve_project(config, workspace=workspace)
-    debug_actions_service.dump_registers(project)
+    project = project_app.resolve_project(config, workspace=workspace)
+    debug_actions_app.dump_registers(project)
 
 
 @debug_app.command("backtrace")
@@ -242,8 +242,8 @@ def debug_backtrace(
     workspace: Path | None = typer.Option(None, help="STM32 project root."),
 ) -> None:
     """Dump the current backtrace."""
-    project = _resolve_project(config, workspace=workspace)
-    debug_actions_service.dump_backtrace(project)
+    project = project_app.resolve_project(config, workspace=workspace)
+    debug_actions_app.dump_backtrace(project)
 
 
 @debug_app.command("snapshot")
@@ -260,14 +260,15 @@ def debug_snapshot(
     observation_limit: int = typer.Option(4, min=1, max=10, help="Max number of recent observations."),
 ) -> None:
     """Aggregate the current debug context into one Agent-friendly snapshot."""
-    project = _resolve_project(config, workspace=workspace)
-    debug_snapshot_service.emit_snapshot(
+    project = project_app.resolve_project(config, workspace=workspace)
+    snapshot = debug_snapshot_app.emit_snapshot(
         project,
         watch=watch,
         svd_path=svd_path,
         backtrace_limit=backtrace_limit,
         observation_limit=observation_limit,
     )
+    renderers.render_snapshot(snapshot)
 
 
 @debug_app.command("peripheral-read")
@@ -280,14 +281,15 @@ def debug_peripheral_read(
     limit: int = typer.Option(8, min=1, max=64, help="Max number of registers when --register is omitted."),
 ) -> None:
     """Read peripheral registers via GDB and decode them with a local SVD."""
-    project = _resolve_project(config, workspace=workspace)
-    debug_snapshot_service.read_peripheral(
+    project = project_app.resolve_project(config, workspace=workspace)
+    result = debug_snapshot_app.read_peripheral(
         project,
         peripheral=peripheral,
         register=register,
         svd_path=svd_path,
         limit=limit,
     )
+    renderers.render_peripheral_read(result)
 
 
 if __name__ == "__main__":

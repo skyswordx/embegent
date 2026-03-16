@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import typer
 
+from ...contracts import SessionState, VerificationEntry
 from ..project import ProjectConfig
 from .paths import (
     compact_path,
@@ -95,17 +97,16 @@ def append_verification(
     path = verification_report_file(workspace)
     payload = read_json(path) or {"entries": []}
     entries = payload.setdefault("entries", [])
-    entries.append(
-        {
-            "timestamp": int(time.time()),
-            "action": action,
-            "ok": ok,
-            "summary": summary,
-            "verification_status": verification_status,
-            "evidence": evidence or {},
-            "state": state or {},
-        }
+    entry = VerificationEntry(
+        timestamp=int(time.time()),
+        action=action,
+        ok=ok,
+        summary=summary,
+        verification_status=verification_status,
+        evidence=evidence or {},
+        state=state or {},
     )
+    entries.append(entry.to_dict())
     payload["entries"] = entries[-limit:]
     payload["latest"] = payload["entries"][-1]
     write_json(path, payload)
@@ -129,23 +130,23 @@ def build_session_state_payload(
 
         lock_state = current_session_lock_state(workspace)
 
-    payload = {
-        "session_id": session_id or (session or {}).get("session_id") or current.get("session_id") or f"{workspace.name}-{int(time.time())}",
-        "workspace": compact_path(str(workspace)),
-        "backend": (session or {}).get("backend", current.get("backend")),
-        "status": status or current.get("status", "unknown"),
-        "last_action": action or current.get("last_action"),
-        "updated_at": int(time.time()),
-        "source": source if source is not None else current.get("source"),
-        "registers_compact": registers if registers is not None else current.get("registers_compact"),
-        "summary": summary if summary is not None else current.get("summary"),
-        "lock": lock_state,
-    }
-    for key in ("gdb_port", "server_kind", "server_pid"):
-        value = (session or {}).get(key, current.get(key))
-        if value is not None:
-            payload[key] = value
-    return payload
+    current_state = SessionState.from_dict(workspace, current)
+    payload = replace(
+        current_state,
+        session_id=session_id or (session or {}).get("session_id") or current_state.session_id,
+        backend=(session or {}).get("backend", current_state.backend),
+        status=status or current_state.status,
+        last_action=action or current_state.last_action,
+        updated_at=int(time.time()),
+        source=source if source is not None else current_state.source,
+        registers_compact=registers if registers is not None else current_state.registers_compact,
+        summary=summary if summary is not None else current_state.summary,
+        lock=lock_state,
+        gdb_port=(session or {}).get("gdb_port", current_state.gdb_port),
+        server_kind=(session or {}).get("server_kind", current_state.server_kind),
+        server_pid=(session or {}).get("server_pid", current_state.server_pid),
+    )
+    return payload.to_dict()
 
 
 def update_session_state(
@@ -175,8 +176,8 @@ def update_session_state(
 
 def latest_verification_entry(workspace: Path) -> dict[str, Any]:
     payload = read_json(verification_report_file(workspace))
-    latest = payload.get("latest")
-    return latest if isinstance(latest, dict) else {}
+    latest = VerificationEntry.from_dict(payload.get("latest") if isinstance(payload, dict) else {})
+    return latest.to_dict() if latest is not None else {}
 
 
 def compact_observation_event(event: dict[str, Any]) -> dict[str, Any]:

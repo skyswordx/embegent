@@ -1,19 +1,20 @@
 from __future__ import annotations
 
-import json
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import typer
 
-from ..agent import context as app_context
-from ..infrastructure import debug_support as debug_ops
-from ..infrastructure import project as project_ops
-from ..infrastructure import state as state_store
-from ..infrastructure import svd as svd_ops
-from .debug_actions_service import locked_session
-from . import verification_service as verify_tools
+from ...agent import context as app_context
+from ...contracts import ExecutionSnapshot, PeripheralReadResult, PeripheralRegisterSummary
+from ...infrastructure.debug import gdb as debug_ops
+from ...infrastructure import project as project_ops
+from ...infrastructure import state as state_store
+from ...infrastructure import svd as svd_ops
+from .control import locked_session
+from .. import verification as verify_tools
 
 
 def emit_snapshot(
@@ -23,28 +24,30 @@ def emit_snapshot(
     svd_path: Path | None = None,
     backtrace_limit: int = 5,
     observation_limit: int = 4,
-) -> None:
+) -> ExecutionSnapshot:
     if len(watch) > 3:
         raise typer.BadParameter("At most 3 --watch targets are supported per snapshot.")
 
     resolved_workspace = project_ops.require_path(project.workspace, "workspace is required")
-    payload: dict[str, Any]
+    snapshot: ExecutionSnapshot
     with state_store.session_command_lock(resolved_workspace, action="debug_snapshot"):
         agent_context = app_context.build_agent_context(resolved_workspace, observation_limit=observation_limit)
-        payload = debug_ops.collect_snapshot_payload(
-            project,
-            resolved_workspace,
-            watch_specs=watch,
-            backtrace_limit=backtrace_limit,
-            observation_limit=observation_limit,
-            svd_path=svd_path,
-            agent_context=agent_context,
+        snapshot = ExecutionSnapshot.from_dict(
+            debug_ops.collect_snapshot_payload(
+                project,
+                resolved_workspace,
+                watch_specs=watch,
+                backtrace_limit=backtrace_limit,
+                observation_limit=observation_limit,
+                svd_path=svd_path,
+                agent_context=agent_context,
+            )
         )
 
-        if payload.get("session_active"):
+        if snapshot.session_active:
             session = state_store.read_session(resolved_workspace)
-            source = payload.get("current_location") or {}
-            registers = payload.get("registers_compact") or {}
+            source = snapshot.current_location
+            registers = snapshot.registers_compact
             verify_tools.record_session_transition(
                 resolved_workspace,
                 session=session,
@@ -58,31 +61,33 @@ def emit_snapshot(
                     "kind": "snapshot",
                     "source": source,
                     "registers_compact": registers,
-                    "summary": f"Snapshot captured with {len(payload.get('peripheral_summary', []))} peripheral summary item(s).",
-                    "raw_excerpt": payload.get("top_backtrace", []),
+                    "summary": f"Snapshot captured with {len(snapshot.peripheral_summary)} peripheral summary item(s).",
+                    "raw_excerpt": snapshot.top_backtrace,
                 },
                 state={
                     "source": source,
                     "watch_count": len(watch),
-                    "observation_count": len(payload.get("recent_observations", [])),
+                    "observation_count": len(snapshot.recent_observations),
                 },
             )
-            payload["captured_at"] = int(time.time())
+            snapshot = replace(snapshot, captured_at=int(time.time()))
 
     refreshed_context = app_context.build_agent_context(
         resolved_workspace,
         observation_limit=observation_limit,
     )
-    payload["session_state"] = refreshed_context["session_state"]
-    payload["recent_observations"] = refreshed_context["recent_observations"]
-    payload["verification"] = refreshed_context["latest_verification"]
-    payload["agent_context"] = {
-        "runtime": refreshed_context["runtime"],
-        "recommended_actions": refreshed_context["recommended_actions"],
-        "state_files": refreshed_context["state_files"],
-    }
-
-    typer.echo(json.dumps(payload, indent=2, ensure_ascii=False))
+    snapshot = replace(
+        snapshot,
+        session_state=refreshed_context["session_state"],
+        recent_observations=refreshed_context["recent_observations"],
+        verification=refreshed_context["latest_verification"],
+        agent_context={
+            "runtime": refreshed_context["runtime"],
+            "recommended_actions": refreshed_context["recommended_actions"],
+            "state_files": refreshed_context["state_files"],
+        },
+    )
+    return snapshot
 
 
 def read_peripheral(
@@ -92,19 +97,26 @@ def read_peripheral(
     register: str | None = None,
     svd_path: Path | None = None,
     limit: int = 8,
-) -> None:
+) -> PeripheralReadResult:
     with locked_session(project, action="debug_peripheral_read") as (resolved_workspace, session):
         resolved_svd_path = svd_ops.resolve_svd_path(resolved_workspace, svd_path)
         peripheral_name, base_address, registers = svd_ops.load_svd_peripheral(resolved_svd_path, peripheral)
         selected = _select_registers(registers, peripheral_name, resolved_svd_path, register, limit)
 
-        decoded: list[dict[str, Any]] = []
+        decoded_payload: list[dict[str, Any]] = []
         for item in selected:
             address = base_address + item.address_offset
-            value, raw_output = debug_ops.read_memory_word(project, resolved_workspace, address)
+            value, raw_output = debug_ops.read_memory_word(
+                project,
+                resolved_workspace,
+                address,
+                echo_output=False,
+            )
             fields = svd_ops.summarize_register_fields(item, value)
-            decoded.append(
+            decoded_payload.append(
                 {
+                    "peripheral": peripheral_name,
+                    "register": item.name,
                     "name": item.name,
                     "address": f"0x{address:08x}",
                     "value": value,
@@ -114,13 +126,12 @@ def read_peripheral(
                 }
             )
 
-        summary = f"Decoded {len(decoded)} register(s) for {peripheral_name} using {resolved_svd_path.name}."
-        _echo_decoded_registers(summary, decoded)
+        summary = f"Decoded {len(decoded_payload)} register(s) for {peripheral_name} using {resolved_svd_path.name}."
         compact = {
             "peripheral": peripheral_name,
             "registers": [
                 {"name": item["name"], "address": item["address"], "value_hex": item["value_hex"]}
-                for item in decoded
+                for item in decoded_payload
             ],
         }
         verify_tools.record_session_transition(
@@ -134,10 +145,37 @@ def read_peripheral(
                 "kind": "peripheral_read",
                 "peripheral": peripheral_name,
                 "svd_path": state_store.compact_path(str(resolved_svd_path)),
-                "decoded": decoded,
+                "decoded": decoded_payload,
             },
             evidence={"svd_path": state_store.compact_path(str(resolved_svd_path))},
             state=compact,
+        )
+        return PeripheralReadResult(
+            summary=summary,
+            peripheral=peripheral_name,
+            svd_path=state_store.compact_path(str(resolved_svd_path)) or str(resolved_svd_path),
+            decoded=[
+                PeripheralRegisterSummary.from_dict(
+                    {
+                        "peripheral": peripheral_name,
+                        "register": item["register"],
+                        "address": item["address"],
+                        "value": item["value"],
+                        "value_hex": item["value_hex"],
+                        "fields": [
+                            {
+                                "name": field["name"],
+                                "bit_offset": int(field["bit_offset"]),
+                                "bit_width": int(field["bit_width"]),
+                                "value": int(field["value"]),
+                                "value_hex": str(field["value_hex"]),
+                            }
+                            for field in item["fields"]
+                        ],
+                    }
+                )
+                for item in decoded_payload
+            ],
         )
 
 
@@ -158,15 +196,3 @@ def _select_registers(
             f"Register {register} not found under peripheral {peripheral_name} in {resolved_svd_path.name}"
         )
     return selected
-
-
-def _echo_decoded_registers(summary: str, decoded: list[dict[str, Any]]) -> None:
-    typer.echo(summary)
-    for item in decoded:
-        typer.echo(f"{item['name']} @ {item['address']} = {item['value_hex']}")
-        for field in item["fields"][:8]:
-            typer.echo(
-                f"  {field['name']}[{field['bit_offset']}:{field['bit_offset'] + field['bit_width'] - 1}] = {field['value_hex']}"
-            )
-        if len(item["fields"]) > 8:
-            typer.echo(f"  ... {len(item['fields']) - 8} more fields")

@@ -4,12 +4,11 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-import typer
-
-from ..infrastructure import debug_support as debug_ops
-from ..infrastructure import project as project_ops
-from ..infrastructure import state as state_store
-from . import verification_service as verify_tools
+from ...contracts import DebugCommandResult
+from ...infrastructure.debug import gdb as debug_ops
+from ...infrastructure import project as project_ops
+from ...infrastructure import state as state_store
+from .. import verification as verify_tools
 
 
 @contextmanager
@@ -47,13 +46,17 @@ def step_debug_session(project: project_ops.ProjectConfig, *, instruction: bool 
         )
 
 
-def continue_debug_session(project: project_ops.ProjectConfig, *, address: str | None = None) -> None:
+def continue_debug_session(
+    project: project_ops.ProjectConfig,
+    *,
+    address: str | None = None,
+) -> DebugCommandResult:
     with locked_session(project, action="debug_continue") as (resolved_workspace, session):
         commands: list[str] = []
         if address is not None:
             commands.append(f"set $pc = {address}")
         commands.extend(["continue&", "disconnect"])
-        debug_ops.session_gdb_command(project, commands)
+        debug_ops.session_gdb_command(project, commands, echo_output=False)
         summary = "Target resumed asynchronously."
         state_store.update_session_state(
             resolved_workspace,
@@ -78,7 +81,11 @@ def continue_debug_session(project: project_ops.ProjectConfig, *, address: str |
             verification_status="hardware_verified",
             state={"resume_address": address},
         )
-        typer.echo("target resumed")
+        return DebugCommandResult(
+            summary="Target resumed asynchronously.",
+            backend=str(session.get("backend") or ""),
+            payload={"resume_address": address},
+        )
 
 
 def dump_registers(project: project_ops.ProjectConfig) -> None:

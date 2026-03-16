@@ -4,9 +4,10 @@ from pathlib import Path
 
 import typer
 
+from ..contracts import FlashResult
 from ..infrastructure import project as project_ops
 from ..infrastructure import state as state_store
-from . import verification_service as verify_tools
+from . import verification as verify_tools
 
 
 def run_flash(
@@ -16,7 +17,7 @@ def run_flash(
     openocd_path: str | None = None,
     cubeprogrammer_path: str | None = None,
     dry_run: bool = False,
-) -> None:
+) -> FlashResult:
     resolved_workspace = verify_tools.prepare_workspace(project, backend=project_ops.resolve_backend(project, backend))
     resolved_elf = project_ops.require_path(project.elf, "elf is required")
     resolved_backend = project_ops.resolve_backend(project, backend)
@@ -24,7 +25,7 @@ def run_flash(
         raise typer.BadParameter(f"ELF not found: {resolved_elf}")
 
     if dry_run:
-        _run_flash_command(
+        return _run_flash_command(
             project,
             resolved_workspace=resolved_workspace,
             resolved_elf=resolved_elf,
@@ -38,7 +39,7 @@ def run_flash(
     with state_store.session_command_lock(resolved_workspace, action="flash"):
         if state_store.session_file(resolved_workspace).exists():
             raise typer.BadParameter("active debug session detected; stop the debug session before flashing")
-        _run_flash_command(
+        return _run_flash_command(
             project,
             resolved_workspace=resolved_workspace,
             resolved_elf=resolved_elf,
@@ -58,7 +59,7 @@ def _run_flash_command(
     openocd_path: str | None,
     cubeprogrammer_path: str | None,
     dry_run: bool,
-) -> None:
+) -> FlashResult:
     if resolved_backend == "openocd":
         resolved_interface = project_ops.resolve_interface_cfg(project.probe, project.interface_cfg)
         if not resolved_interface:
@@ -79,7 +80,7 @@ def _run_flash_command(
             "-c",
             f"program {project_ops.openocd_quote(str(resolved_elf))} verify reset exit",
         ]
-        project_ops.run_command(command, cwd=resolved_workspace, dry_run=dry_run)
+        command_result = project_ops.run_command(command, cwd=resolved_workspace, dry_run=dry_run, echo=False)
         if not dry_run:
             state_store.append_verification(
                 resolved_workspace,
@@ -90,7 +91,13 @@ def _run_flash_command(
                 evidence={"elf": state_store.compact_path(str(resolved_elf))},
                 state={"backend": "openocd"},
             )
-        return
+        return FlashResult(
+            summary="Flash command prepared for OpenOCD." if dry_run else "Flash completed with OpenOCD.",
+            backend="openocd",
+            elf=state_store.compact_path(str(resolved_elf)) or str(resolved_elf),
+            dry_run=dry_run,
+            command_result=command_result,
+        )
 
     if resolved_backend == "stlink":
         cubeprogrammer = cubeprogrammer_path or project_ops.resolve_executable("stm32_programmer_cli", "STM32_PROGRAMMER_CLI")
@@ -104,7 +111,7 @@ def _run_flash_command(
         if project.frequency_khz:
             connect_arg += f" freq={project.frequency_khz}"
         command = [cubeprogrammer, "-c", connect_arg, "-w", str(resolved_elf), "-v", "-rst"]
-        project_ops.run_command(command, cwd=resolved_workspace, dry_run=dry_run)
+        command_result = project_ops.run_command(command, cwd=resolved_workspace, dry_run=dry_run, echo=False)
         if not dry_run:
             state_store.append_verification(
                 resolved_workspace,
@@ -115,6 +122,12 @@ def _run_flash_command(
                 evidence={"elf": state_store.compact_path(str(resolved_elf))},
                 state={"backend": "stlink"},
             )
-        return
+        return FlashResult(
+            summary="Flash command prepared for ST-LINK." if dry_run else "Flash completed with ST-LINK backend.",
+            backend="stlink",
+            elf=state_store.compact_path(str(resolved_elf)) or str(resolved_elf),
+            dry_run=dry_run,
+            command_result=command_result,
+        )
 
     raise typer.BadParameter(f"Unsupported backend: {resolved_backend}")

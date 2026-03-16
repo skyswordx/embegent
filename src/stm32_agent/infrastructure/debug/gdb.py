@@ -9,9 +9,9 @@ from typing import Any
 
 import typer
 
-from . import project as project_ops
-from . import state as state_store
-from . import svd as svd_ops
+from .. import project as project_ops
+from .. import state as state_store
+from .. import svd as svd_ops
 
 
 def extract_source_location(text: str) -> dict[str, Any]:

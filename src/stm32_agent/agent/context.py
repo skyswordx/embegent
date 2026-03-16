@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from ..contracts import AgentContext, AgentRuntimeSummary, SessionState, VerificationEntry
 from ..infrastructure import state as state_store
 
 
@@ -75,14 +76,24 @@ def build_agent_context(
 ) -> dict[str, Any]:
     resolved_workspace = workspace.resolve()
     project_profile = state_store.read_json(state_store.project_profile_file(resolved_workspace))
-    session_state = state_store.read_session_state(resolved_workspace)
+    session_state_payload = state_store.read_session_state(resolved_workspace)
     recent_observations = state_store.recent_observations(resolved_workspace, limit=observation_limit)
-    latest_verification = state_store.latest_verification_entry(resolved_workspace)
+    latest_verification_payload = state_store.latest_verification_entry(resolved_workspace)
 
-    return {
-        "workspace": state_store.compact_path(str(resolved_workspace)),
-        "state_files": _state_files(resolved_workspace),
-        "capabilities": {
+    runtime = AgentRuntimeSummary(
+        **_build_runtime_summary(
+            resolved_workspace,
+            session_state_payload,
+            latest_verification_payload,
+        )
+    )
+    session_state = SessionState.from_dict(resolved_workspace, session_state_payload)
+    latest_verification = VerificationEntry.from_dict(latest_verification_payload)
+
+    context = AgentContext(
+        workspace=state_store.compact_path(str(resolved_workspace)) or str(resolved_workspace),
+        state_files=_state_files(resolved_workspace),
+        capabilities={
             "build": True,
             "flash": True,
             "debug": True,
@@ -90,18 +101,15 @@ def build_agent_context(
             "svd": True,
             "verification": True,
         },
-        "runtime": _build_runtime_summary(
-            resolved_workspace,
-            session_state,
-            latest_verification,
-        ),
-        "recommended_actions": _recommended_actions(
+        runtime=runtime,
+        recommended_actions=_recommended_actions(
             project_profile,
-            session_state,
-            latest_verification,
+            session_state_payload,
+            latest_verification_payload,
         ),
-        "project_profile": project_profile,
-        "session_state": session_state,
-        "recent_observations": recent_observations,
-        "latest_verification": latest_verification,
-    }
+        project_profile=project_profile,
+        session_state=session_state,
+        recent_observations=recent_observations,
+        latest_verification=latest_verification,
+    )
+    return context.to_dict()

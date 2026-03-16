@@ -1,377 +1,476 @@
-<div align="center">
-
-**简体中文** | [English](README.en.md)
-
-<img src="assets/embegent_logo.png" alt="logo" width="220" />
-
 # embegent
 
-面向 STM32 真机调试场景的 `CLI + MCP` 执行层原型
+面向 STM32 真机调试场景的 agent-friendly harness 原型。
 
-把真实板卡的构建、烧录、调试和运行态观测，整理成适合 `CLI -> MCP -> Agent` 逐层暴露的工程化接口。
+它不是一个“把 OpenOCD、GDB、CMake 拼在一起”的脚本集合，而是在嵌入式 MCU 调试场景里，把工程、工具、状态、证据、上下文和输出协议整理成一套适合 Agent 长时间稳定工作的执行环境。
 
-`Python 3.11+` `STM32` `ST-LINK` `OpenOCD` `GDB` `CMake`
+这份 README 的核心视角，不再是“有哪些命令”，而是：
 
-</div>
+- 为什么 `embegent` 本质上是一个 embedded harness。
+- 为什么 token、memory、上下文分层是必要的外围 infra。
+- 为什么 CLI 只是一个 renderer，而不是系统内部的真相格式。
+- 为什么后续接 MCP / JSON-RPC 时，不应该再从终端文本反解析。
 
 ---
 
-## 项目简介
+## Harness Engineering 视角
 
-`embegent` 不是一个新的图形集成开发环境，也不是要重做一整套嵌入式工具链。
+`embegent` 的设计核心，直接受到 OpenAI 官方文章
+[Harness engineering: leveraging Codex in an agent-first world](https://openai.com/index/harness-engineering/)
+的启发。
 
-它更聚焦于一件事：
+这篇文章的核心观点，不是“让 Agent 多写代码”，而是：
 
-- 复用现有 STM32 工程、`CMakePresets.json`、`OpenOCD`、`ST-LINK_gdbserver`
-- 把 `build -> flash -> debug -> monitor` 收敛成稳定的命令行接口
-- 把原始调试结果沉淀成适合 Agent 消费的结构化调试上下文
-- 为后续 `MCP tools` 和 `JSON-RPC` 适配提供可信的本地执行层
+- 真正的瓶颈通常不是模型不会做事，而是环境没有被设计成适合 Agent 工作。
+- context 是稀缺资源，应该给 Agent 一张地图，而不是一份巨大的说明书。
+- repository-local、结构化、可验证的知识，才是 agent runtime 的 system of record。
+- 输出文本不是事实本身，结构化状态、约束和证据才是。
+- 代码之外的 scaffolding、feedback loop、observability、memory 分层，才是 agent 系统能长期工作的关键。
 
-也就是说这个项目要把人手点 IDE 的真机调试链路变成可脚本化、可被 Agent 调用的基础设施。
+`embegent` 可以理解为把这套 harness engineering 思想，映射到 STM32 真机调试场景中的一次工程化实践。
 
-## 项目目标
+---
 
-当前 AI Agent 在嵌入式场景里最常见的问题不是不会写代码，而是：
+## 项目定位
 
-- 拿不到真实板卡状态
-- 看不到调试现场
-- 上下文里只有源码，没有运行时证据
-- 一旦接入 `GDB / OpenOCD / 串口`，原始输出又太大、太乱、太不适合模型消费
+`embegent` 关注的是一件事：
 
-`embegent` 要解决的就是这件事：
+把一个真实 STM32 工程，变成 Agent 可操作、可观察、可验证、可复盘的本地执行环境。
 
-> 让 Agent 可以在真实 STM32 工程上获得足够多、足够准、但不过载的调试信息。
+它不重做固件工程，不重做 GDB Server，也不替代 IDE。它做的是：
 
-这个项目的核心思想不是把更多调试命令塞给 Agent，而是把真机调试链路重构成一套更适合 Agent 协作的执行架构。
+- 复用已有 STM32 工程和构建链。
+- 复用 OpenOCD、ST-LINK、arm-none-eabi-gdb、CMSIS-SVD 等现有基础设施。
+- 把 `build / flash / debug / monitor / svd` 收口为稳定用例。
+- 把运行时上下文压缩成 Agent 可以按层读取的 state / evidence。
+- 把输出从“终端文本”升级为“结构化结果 + 渲染层”。
 
+换句话说，`embegent` 不是一个 IDE 替代品，而是一个面向嵌入式 Agent 的执行 harness。
+
+---
 
 ## 当前状态
 
-当前阶段是 `CLI MVP`，已经不是空壳。
+当前仓库已经完成第一轮从原型脚本向 agent-friendly 分层架构的重构：
 
-在代码组织上，当前也已经完成第一轮重构：
+- `interfaces` 负责 CLI 参数接入与结果渲染。
+- `application` 负责用例编排，并尽量返回结构化结果。
+- `infrastructure` 负责和 OpenOCD、ST-LINK、GDB、SVD、进程、状态文件打交道。
+- `agent` 负责把状态文件压缩成 Agent 友好的上下文。
+- `contracts.py` 提供跨层共享的数据契约。
 
-- `cli.py` 负责命令编排
-- `project.py` 负责配置与执行基础设施
-- `state.py` 作为兼容入口，内部继续拆到 `state_paths.py / state_lock.py / state_runtime.py`
-- `svd.py` 负责 SVD 拉取与解析
-- `debug_support.py` 负责 GDB 与调试快照辅助
-- `tools/build.py` 负责构建命令实现
-- `tools/flash.py` 负责烧录命令实现
-- `tools/debug.py` 作为兼容入口，内部继续拆到 `debug_session.py / debug_actions.py / debug_snapshot.py`
-- `tools/monitor.py` 负责串口监视命令实现
-- `tools/svd.py` 负责 SVD 拉取命令实现
-- `tools/verify.py` 负责验证记录公共能力
-- `app/context.py` 负责组装面向 Agent 的结构化上下文
+当前已经落地的关键结果：
 
-已具备的命令：
+- `doctor`、`svd fetch`、`build`、`flash`、`debug start/stop/continue/snapshot/peripheral-read` 都已经改成 application 返回结构化结果，由 interfaces 统一渲染。
+- `monitor` 已切成“事件流 + 会话摘要”模式，实时输出由 interfaces 决定如何展示，application 不再直接 `typer.echo`。
+- `.stm32-agent/` 目录中的状态文件已经作为 Agent 的本地 memory 基础层。
+- README 已按真实结构、真实现状和真实约束重写，不再描述旧兼容层。
 
-| 环境检查 | 构建 | 烧录 | 监视 | 获取 SVD | 启动调试 | 停止调试 | 单步执行 | 继续执行 | 读取寄存器 | 查看回溯 | 生成快照 | 读取外设寄存器 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `doctor` | `build` | `flash` | `monitor` | `svd fetch` | `debug start` | `debug stop` | `debug step` | `debug continue` | `debug registers` | `debug backtrace` | `debug snapshot` | `debug peripheral-read` |
+这意味着当前项目已经不是“命令能跑”的状态，而是“内部事实格式和展示格式已经分离”的状态。
 
-已在真实工程和真实板卡上跑通过的链路：
+---
 
-| 构建 | OpenOCD 烧录 | ST-LINK 烧录 | OpenOCD 启动调试 | ST-LINK 启动调试 | 读取寄存器 | 单步执行 | 继续执行 | 查看回溯 | 生成快照 | 停止调试 | 获取 STM32H750VBT6 的 SVD | 读取 RCC.CR 寄存器 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `build` | `flash --backend openocd` | `flash --backend stlink` | `debug start --backend openocd` | `debug start --backend stlink` | `debug registers` | `debug step` | `debug continue` | `debug backtrace` | `debug snapshot` | `debug stop` | `svd fetch --chip STM32H750VBT6` | `debug peripheral-read --peripheral RCC --register CR` |
+## 目录结构
 
-真实验证基于的工程样例已纳入仓库：
-
-- [`workspaces/stm32h750vbt6`](workspaces/stm32h750vbt6)
-
-
-
-
-## 实际架构
-
-当前功能范围内实现了
-- 面向 STM32 工程的本地自动化链路
-- 兼容已有 `VS Code + CMake + OpenOCD + ST-LINK + GDB` 工作流
-- 单板、单活动调试会话管理
-- 构建、烧录、启动调试、单步、继续、回溯、寄存器读取、串口监视
-- SVD 下载与外设寄存器字段语义化读取
-- 调试证据落盘和结构化摘要
-
-当前未实现
--  `VS Code / CubeIDE` 的图形调试体验
-- 多板并发调试
-- 支持 `J-Link`、`PyOCD`、`Ozone`
-- 有完整断点管理、表达式求值、变量观察、RTOS 感知调试
-
-
-`embegent` 当前的实际组织不是“一个命令包”，而是 4 层结构：
-
-```mermaid
-flowchart TD
-    A["STM32 project workspace"] --> B["CLI execution layer"]
-    B --> C["Backend adapters"]
-    C --> C1["CMake / Ninja"]
-    C --> C2["OpenOCD"]
-    C --> C3["ST-LINK_gdbserver / STM32_Programmer_CLI"]
-    C --> C4["GDB / Serial / SVD"]
-    B --> D["Structured evidence layer"]
-    D --> D1["project_profile.json"]
-    D --> D2["session_state.json"]
-    D --> D3["observation.json"]
-    D --> D4["verification_report.json"]
-    D --> E["Future MCP / JSON-RPC transport"]
-    E --> F["AI Agent / Human reviewer"]
-```
-
-再往实现职责上看，更适合把它理解成下面这条链：
+当前真实目录如下：
 
 ```text
-用户 / Agent 请求
-  -> 主编排循环
-  -> 调试工具执行层
-  -> 结构化状态与证据层
-  -> CLI / MCP / JSON-RPC 适配层
-  -> 人类验收或 Agent 下一轮决策
+embegent/
+  assets/
+  configs/
+    examples/
+      project.example.yaml
+      smoke.example.yaml
+      stlink.example.yaml
+      stm32h750vbt6.openocd.yaml
+  doc/
+  src/stm32_agent/
+    agent/
+      context.py
+    application/
+      build.py
+      doctor.py
+      flash.py
+      monitor.py
+      projects.py
+      svd.py
+      verification.py
+      debug/
+        control.py
+        session.py
+        snapshot.py
+    infrastructure/
+      config.py
+      process.py
+      project.py
+      svd.py
+      tooling.py
+      debug/
+        gdb.py
+      state/
+        lock.py
+        paths.py
+        runtime.py
+    interfaces/
+      cli.py
+      render.py
+    contracts.py
+  tests/
+  workspaces/
+    stm32h750vbt6/
 ```
 
-### 1. 工程工作区层
+---
 
-项目本身不拥有你的固件逻辑，它复用现有 STM32 工程作为工作空间。
+## 分层职责
 
-当前仓内示例：
+### 1. `interfaces`
 
-- `workspaces/stm32h750vbt6`
+对外适配层，当前主要是 CLI。
 
-### 2. 命令行执行层
+- `cli.py` 负责参数解析、路由和退出码。
+- `render.py` 负责把 application 返回的结构化结果渲染成终端输出。
 
-这是当前已经成立的 MVP 核心。
+这一层不是业务事实层，而是展示和协议适配层。
 
-它负责：
+### 2. `application`
 
-- 读配置
-- 发起 `build / flash / debug / monitor`
-- 管理后台 session
-- 落盘日志与状态
-- 对外输出稳定命令接口
+用例层，负责组织一次操作应该怎么完成。
 
-它不应该负责的事情是：
+- `doctor.py`、`svd.py`、`build.py`、`flash.py` 返回结构化结果。
+- `monitor.py` 负责产生监视事件流与结束摘要。
+- `debug/session.py` 管理调试会话启动与停止。
+- `debug/control.py` 管理继续执行、单步、寄存器和回溯采样。
+- `debug/snapshot.py` 负责聚合 Agent 友好的调试快照。
 
-- 承载复杂业务判断
-- 自己解释所有调试现象
-- 直接把原始噪声输出喂给模型
+这一层的目标是“编排”，不是“直接输出终端文本”。
 
-理想状态下，这一层对应一个很薄的主编排循环，只负责：
+### 3. `infrastructure`
 
-- 接收请求
-- 读取当前工作区和会话状态
-- 组装最小上下文
-- 调用合适工具
-- 把结果写回状态层
+基础设施层，负责和具体工具与文件系统交互。
 
-### 3. 后端适配层
+- `config.py` / `tooling.py` / `process.py` 处理配置、可执行文件发现和命令执行。
+- `debug/gdb.py` 处理 GDB 会话与寄存器、回溯、内存读取。
+- `svd.py` 处理 CMSIS-SVD 下载、解析与寄存器字段摘要。
+- `state/` 负责 `.stm32-agent/` 目录下的状态文件与锁管理。
 
-当前已接入的后端能力：
+### 4. `agent`
 
-- `CMake / presets`
-- `OpenOCD`
-- `ST-LINK_gdbserver`
-- `STM32_Programmer_CLI`
-- `arm-none-eabi-gdb`
-- `pyserial`
-- `CMSIS-SVD`
+Agent 上下文投影层。
 
-这层的职责是和真实工具对接，而不是把工具能力重新发明一遍。
+- `agent/context.py` 从状态文件构造低噪声、可压缩、可复核的运行时上下文。
+- `contracts.py` 保持上下文结构与用例输出结构稳定。
 
-当前第二轮下沉已经开始把执行逻辑继续收口到 `src/stm32_agent/tools/`：
+---
 
-- `build`
-- `flash`
-- `debug`
-- `monitor`
-- `svd`
-- `verify`
+## 为什么外围 Infra 很重要
 
-当前已经落地的是 `tools/build.py`、`tools/flash.py`、`tools/debug.py`、`tools/monitor.py`、`tools/svd.py`，并补了 `tools/verify.py` 作为验证记录的公共入口。
+在传统人类主导的调试流程里，人可以直接看：
 
-其中 `tools/debug.py` 现在只保留兼容导出，具体职责已经下沉到：
+- IDE 当前停在哪里
+- GDB 输出的大段文本
+- 串口一行一行滚出来的日志
+- 口头约定、文档、聊天记录里的背景信息
 
-- `debug_session.py`
-- `debug_actions.py`
-- `debug_snapshot.py`
+但对 Agent 来说，如果这些信息没有被放进一个可访问、可验证、可按需展开的本地系统里，那么它们就几乎等于不存在。
 
-这样主循环只负责调度，具体执行和异常处理都留在工具层。
+所以外围 infra 在这里不是附属品，而是核心能力：
 
-同时，当前调试命令已经引入“会话级串行化”保护：
+- 工程配置必须可发现。
+- 调试状态必须可读。
+- 证据必须可追溯。
+- 输出必须可序列化。
+- memory 必须分层。
+- token 开销必须被主动管理。
 
-- `debug start / stop / step / continue / registers / backtrace / snapshot / peripheral-read`
-- 这些命令共享同一把会话锁
-- 如果 Agent 或外部客户端错误地并行调度这些命令，它们会排队或返回“session busy”，而不是互相踩掉 `session.json`
-- `flash` 也会在活动调试会话存在时拒绝执行，避免烧录和调试 session 抢同一套硬件资源
+这正是 harness engineering 在嵌入式场景里的价值。
 
-这层保护的目标不是让 Agent “更聪明”，而是让执行层即使面对不合理调度，也尽量保持状态一致性。
+---
 
-### 4. 结构化证据层
+## `.stm32-agent` 作为本地 Memory
 
-这是项目和普通脚本堆砌方案最大的不同点。
-
-当前已经开始把调试上下文按用途拆成四类文件：
+每个 workspace 下会生成 `.stm32-agent/`，其中最关键的是四类文件：
 
 - `project_profile.json`
+  低频静态画像。记录 workspace、elf、backend、svd、本地配置等背景信息。
 - `session_state.json`
+  当前调试会话的最小导航信息。包括 session 状态、后端、锁状态、最近动作、关键寄存器摘要。
 - `observation.json`
+  最近几次调试观察结果的滑动窗口，例如 snapshot、registers、backtrace、peripheral-read、monitor。
 - `verification_report.json`
+  用于回放“做了什么、为什么认为成功、证据是什么”的验证记录。
 
-它们的目的不是“多写几个 JSON”，而是把 context 用在刀刃上：
+这四类文件不是“多写几个 JSON”，而是在工作区里建立一套对 Agent 可见、可验证的 system of record。
 
-- 静态背景只记录一次
-- 会话状态保持最小
-- 动态观测只保留最近窗口
-- 验证结论必须附带证据
+---
 
-这一层的意义，是把“调试信息”变成“Agent 可消费、也能被人类复核”的调试上下文，而不是单纯写几份 JSON。
+## 推荐的 Token / Memory 分层
 
-当前 `session_state.json` 的生成也已经收敛到统一的 payload 组装逻辑，锁状态更新和调试状态更新不再各写一套字段，避免状态文件在并发场景里出现格式漂移。
+这是 `embegent` 下一阶段最重要的设计方向之一。
 
-## 理想的 Agent 架构
+推荐把 Agent 在嵌入式调试中的 memory 分成 4 层：
 
-如果把这个项目真正做成 Agent-ready 体系，最值得坚持的是下面 5 条：
+### 1. Static Memory
 
-### 1. 主代理只做编排
+低频、稳定、可长期复用。
 
-主代理不直接承担所有细节逻辑，它只做：
+典型来源：
 
-- 判断当前处于什么调试阶段
-- 决定下一步调用哪个工具
-- 选择需要读取哪一层上下文
-- 输出下一步行动或结论
+- `project_profile.json`
+- 板卡型号、芯片型号
+- probe / backend 能力
+- ELF 路径、SVD 路径
+- 固定的调试约束和项目假设
 
-这能避免“一个 Agent 同时负责执行、观察、总结、解释”带来的复杂度失控。
+适合做默认上下文，但必须保持紧凑。
 
-### 2. 工具层负责真实执行
+### 2. Session Memory
 
-`build / flash / debug / monitor / svd / verify` 应该是独立能力，而不是写死在主循环里的分支。
+当前会话的最小导航信息。
 
-这样做的好处是：
+典型来源：
 
-- 更容易测试
-- 更容易替换 backend
-- 更容易把 CLI 暴露成 MCP tools
-- 更容易对失败做精确归因
+- `session_state.json`
+- 当前 `status`
+- `backend`
+- `last_action`
+- `sp/lr/pc/control`
+- 当前 source location
 
-### 3. 上下文必须按需加载
+这一层应该很小，因为它是每轮最可能被反复读取的热路径。
 
-这点非常关键。
+### 3. Working Memory
 
-Agent 不应该默认看到所有原始输出，而应该先看到摘要，再按需展开：
+当前任务窗口内的观察结果。
 
-- 先看 `session_state.json`
-- 再看 `observation.json`
-- 还不够再取 `debug snapshot`
-- 最后必要时才看原始日志或原始 GDB 文本
+典型来源：
 
-这就是“把 context 用在刀刃上”。
+- 最近 1 到 4 条 `observation`
+- 最新一次 `ExecutionSnapshot`
+- 当前外设摘要
+- 最近一次 `build` / `flash` / `debug` 的摘要结果
 
-### 4. 慢任务应该后台化
+这一层要能支撑单轮决策，但不能无限增长。
 
-长构建、长烧录、长监视、长时间观测，不应该阻塞整个交互。
+### 4. Evidence Store
 
-后续理想形态里，`embegent` 应该支持：
+大体积、低频、按需展开。
 
-- 调试子任务后台执行
-- 长时间 monitor 持续采样
-- 构建或验证结束后把结果写回事件或状态层
-- 主代理只读取结果摘要并继续决策
+典型来源：
 
-### 5. 适配层必须和核心逻辑解耦
+- `stdout` / `stderr`
+- OpenOCD / GDB server 日志
+- monitor 全量串口流
+- 原始 backtrace、寄存器全文
+- 完整构建日志
 
-CLI、MCP、JSON-RPC、VS Code 集成都不应该反过来塑造核心业务结构。
+这一层不应默认进入 prompt，而应通过引用、路径、tail、filter 等方式按需读取。
 
-更合理的关系是：
+### 建议的默认策略
 
-- 核心层只关心执行和证据
-- 适配层只关心怎么把核心能力暴露出去
+对于后续 MCP / JSON-RPC 适配，更合理的默认策略是：
 
-这样后面不管你接 `MCP`、接 VS Code、还是接别的 Agent Host，都不用重写核心逻辑。
+- 默认返回 `compact` 结果
+- 仅在显式请求时返回 `verbose` / `evidence`
+- 原始大文本优先落盘，再返回引用路径或摘要
 
-## 面向 Agent 的调试上下文组织
+这不是 OpenAI 官方给出的固定 schema，而是将 harness engineering 的原则映射到 STM32 调试场景后的推荐设计。
 
-如果最终目标是让 Agent 闭环测试，这一层比命令数量更重要。
+---
 
-### `project_profile.json`
+## 结构化返回结果
 
-低频静态画像，避免每轮提示词重复塞背景信息。
+当前 CLI 看到的终端输出，并不是 application 直接打印的“事实本身”，而是 `interfaces/render.py` 对结构化结果做的渲染。
 
-典型内容：
+现在的主链路已经变成：
 
-- 工程路径
-- ELF 路径
-- 调试后端 / 探针
-- 预设配置
-- 串口配置
-- SVD 路径
-- 芯片画像补充信息
+```text
+CLI 参数
+  -> application 用例
+  -> contracts.py 中的数据模型
+  -> interfaces/render.py
+  -> 终端文本
+```
 
-### `session_state.json`
+### 已落地的一次性结果
 
-当前调试会话的最小导航信息。
+`build`、`flash`、`doctor`、`svd fetch`、`debug start/stop/continue` 这类命令，现在都先返回结构化结果，再决定怎么显示。
 
-典型内容：
+目前已经落地的核心返回模型包括：
 
-- session id
-- halted / running / stopped
-- 当前 PC / LR / SP
-- 当前源码位置
-- 最近一次命令
-- 调试后端状态
-- 当前会话锁状态，例如 `busy / idle`、占用动作、锁持有时长
+- `DoctorResult`
+- `SvdFetchResult`
+- `BuildResult`
+- `FlashResult`
+- `DebugCommandResult`
+- `ExecutionSnapshot`
+- `PeripheralReadResult`
 
-### `observation.json`
+其中 `BuildResult` / `FlashResult` 内部又复用了 `CommandRunResult`：
 
-给 Agent 的主工作上下文，默认保留最近窗口而不是全量历史。
+```json
+{
+  "command": ["cmake", "--build", "--preset", "Debug"],
+  "cwd": "D:/.../workspaces/stm32h750vbt6",
+  "stdout": "...",
+  "stderr": "",
+  "returncode": 0,
+  "dry_run": false
+}
+```
 
-典型内容：
+`BuildResult` 大致会长这样：
 
-- 最近一次 `registers` 摘要
-- 最近一次 `backtrace`
-- 最近一次 `step` 前后 PC 变化
-- 最近一次 `peripheral-read` 字段解析
-- 最近若干条 `monitor` 输出
+```json
+{
+  "summary": "Build completed with CMake preset.",
+  "build_dir": "D:/.../workspaces/stm32h750vbt6/build/Debug",
+  "mode": "preset",
+  "configured": true,
+  "dry_run": false,
+  "steps": [
+    {
+      "command": ["cmake", "--preset", "Debug"],
+      "cwd": "D:/.../workspaces/stm32h750vbt6",
+      "stdout": "...",
+      "stderr": "",
+      "returncode": 0,
+      "dry_run": false
+    },
+    {
+      "command": ["cmake", "--build", "--preset", "Debug"],
+      "cwd": "D:/.../workspaces/stm32h750vbt6",
+      "stdout": "...",
+      "stderr": "",
+      "returncode": 0,
+      "dry_run": false
+    }
+  ]
+}
+```
 
-### `verification_report.json`
+`FlashResult` 大致会长这样：
 
-给人和 Agent 做判断的证据层。
+```json
+{
+  "summary": "Flash completed with OpenOCD.",
+  "backend": "openocd",
+  "elf": "D:/.../build/Debug/stm32h750vbt6.elf",
+  "dry_run": false,
+  "command_result": {
+    "command": ["openocd", "-f", "interface/stlink.cfg", "..."],
+    "cwd": "D:/.../workspaces/stm32h750vbt6",
+    "stdout": "...",
+    "stderr": "",
+    "returncode": 0,
+    "dry_run": false
+  }
+}
+```
 
-典型内容：
+### 已落地的流式结果
 
-- 执行动作
-- 判定摘要
-- `verification_status`
-- 证据路径
-- 关键状态快照
+`monitor` 不适合被压成一次性静态结果，所以它现在是“事件流 + 会话摘要”两段式模型：
 
-这四层并不是平铺文件，而是一套有顺序的读取策略：
+- `MonitorEvent`
+  表示一条实时事件，可能是启动状态，也可能是一行串口输出。
+- `MonitorResult`
+  表示监视结束后的总结，例如端口、波特率、行数、是否中断、日志文件路径。
 
-1. 先读取 `project_profile.json` 了解工程背景
-2. 再读取 `session_state.json` 确认当前调试位置
-3. 如需推理，读取 `observation.json`
-4. 如需判断成功与否，读取 `verification_report.json`
+`MonitorEvent` 大致会长这样：
 
-只有在这些摘要还不够的时候，才应该回退到原始日志、原始串口输出和原始 GDB 文本。
+```json
+{
+  "kind": "line",
+  "text": "[12:01:03] boot ok",
+  "port": "COM6",
+  "baudrate": 115200,
+  "timestamp": "12:01:03"
+}
+```
 
-## 信息可信度分级
+`MonitorResult` 大致会长这样：
 
-为避免给 Agent 错误确定性，结果需要带可信度分级：
+```json
+{
+  "summary": "Monitor session completed on COM6.",
+  "port": "COM6",
+  "baudrate": 115200,
+  "duration": 5.0,
+  "raw": false,
+  "interrupted": false,
+  "line_count": 42,
+  "log_file": "D:/.../.stm32-agent/logs/monitor.log"
+}
+```
 
-- `unverified`
-- `cli_verified`
-- `hardware_verified`
-- `human_verified`
+---
 
-含义很直接：
+## 为什么后续不用再反解析终端文本
 
-- CLI 自己判断成功，不等于硬件真的正确
-- 真机跑过才算 `hardware_verified`
-- 人类看过现象并确认，才算 `human_verified`
+如果系统内部的真实输出只有终端文本，那么后续接 MCP 或 JSON-RPC 时，只能：
 
-## 功能接口
+1. 调 CLI
+2. 拿到一大段文本
+3. 再用正则或额外解析把它拆回结构化字段
 
-### 命令行接口
+这条链路的问题是：
+
+- 文本格式一改，协议层就跟着坏。
+- 很难做稳定 schema。
+- 很难控制 token。
+- 很难分清摘要和证据。
+
+现在的方向是反过来：
+
+1. application 先返回 dataclass 结果
+2. CLI 只是其中一个 renderer
+3. MCP / JSON-RPC 可以直接消费 dataclass 转出来的 `dict`
+
+所以终端文本现在只是“展示形式”，不再是“系统内部的事实格式”。
+
+---
+
+## 如何对接 MCP / JSON-RPC
+
+未来接 MCP 或 JSON-RPC 时，推荐复用现有 application，而不是重新包一层 CLI 子进程。
+
+更直接的接法是：
+
+```text
+MCP tool / JSON-RPC method
+  -> 调 application.run_xxx(...)
+  -> 拿到 contracts.py 的 dataclass
+  -> to_dict() / asdict()
+  -> 作为协议返回值
+```
+
+可以按下面的方式理解：
+
+- CLI 适配
+  `BuildResult -> render_build_result() -> 终端输出`
+- MCP tool 适配
+  `BuildResult -> result.to_dict() -> structured tool output`
+- JSON-RPC 适配
+  `BuildResult -> {"jsonrpc":"2.0","result": result.to_dict(), "id": ...}`
+
+对 `monitor` 这种流式场景，则可以进一步拆成：
+
+- CLI
+  `MonitorEvent -> render_monitor_event()`
+  `MonitorResult -> render_monitor_result()`
+- JSON-RPC
+  `MonitorEvent -> progress notification / event message`
+  `MonitorResult -> final result`
+- MCP
+  `MonitorEvent -> streaming chunk / event callback`
+  `MonitorResult -> structured completion payload`
+
+这就是“后续接 MCP/JSON-RPC 时不需要再从终端文本反解析”的具体含义：协议层直接复用 use case 返回的数据模型，而不是把 CLI 当黑盒。
+
+---
+
+## 已支持命令
 
 ```bash
 stm32-agent doctor
@@ -389,164 +488,81 @@ stm32-agent debug peripheral-read --peripheral RCC --register CR
 stm32-agent debug stop
 ```
 
-### 面向 Agent 的预期工具
+---
 
-更适合 Agent 暴露的接口会分两类：
+## 快速开始
 
-动作类：
+### 1. 安装
 
-- `stm32_build`
-- `stm32_flash`
-- `stm32_debug_start`
-- `stm32_debug_step`
-- `stm32_debug_continue`
-- `stm32_debug_stop`
-- `stm32_monitor`
-- `stm32_svd_fetch`
-
-语义类：
-
-- `stm32_get_execution_snapshot`
-- `stm32_get_runtime_summary`
-- `stm32_verify_expectation`
-- `stm32_collect_failure_bundle`
-
-原因是 Agent 真正需要的不是更多命令，而是更少噪声、更高密度的调试信息。
-
-更进一步说，未来真正推荐暴露给 Agent 的，不是整套细粒度命令，而是少量粗粒度能力：
-
-- `stm32_build`
-- `stm32_flash`
-- `stm32_debug_start`
-- `stm32_debug_snapshot`
-- `stm32_debug_step`
-- `stm32_debug_continue`
-- `stm32_debug_stop`
-- `stm32_verify_expectation`
-
-先让 Agent 学会基于摘要做决策，再按需下钻，是比“默认暴露所有内部细节”更稳的路线。
-
-## 项目结构
-
-当前仓库组织可以按下面理解：
-
-```text
-embegent/
-  configs/examples/          示例配置
-  src/stm32_agent/           CLI、工具层与状态模型
-  tests/                     最小测试与夹具
-  workspaces/stm32h750vbt6/  真机验证样例工程
+```bash
+python -m pip install -e .
 ```
 
-职责边界如下：
+### 2. 使用示例配置
 
-- `src/stm32_agent/cli.py`
-  当前命令行编排入口，主要负责参数接收、流程调度和结果输出
-- `src/stm32_agent/project.py`
-  配置模型、可执行文件发现、后端解析、通用命令执行
-- `src/stm32_agent/state.py`
-  `.stm32-agent/` 目录下的结构化状态与证据读写
-- `src/stm32_agent/svd.py`
-  CMSIS-SVD 拉取、解析、外设寄存器元数据处理
-- `src/stm32_agent/debug_support.py`
-  GDB 批处理、调试会话辅助、快照采集和寄存器/回溯摘要
-- `src/stm32_agent/tools/build.py`
-  `build` 命令的实际执行实现
-- `src/stm32_agent/tools/flash.py`
-  `flash` 命令的实际执行实现
-- `src/stm32_agent/tools/debug.py`
-  `debug` 能力的兼容入口，内部继续拆到 `debug_session / debug_actions / debug_snapshot`
-- `src/stm32_agent/tools/monitor.py`
-  `monitor` 命令的实际执行实现
-- `src/stm32_agent/tools/svd.py`
-  `svd fetch` 命令的实际执行实现
-- `src/stm32_agent/tools/verify.py`
-  结构化验证记录的公共工具入口
-- `src/stm32_agent/app/context.py`
-  面向 Agent 的上下文聚合入口，统一读取 `project_profile / session_state / observation / verification`
-- `configs/examples/`
-  让外部用户快速复用工程配置，而不是硬编码路径
-- `workspaces/`
-  放公开可参考的真实样例工程，用于验证链路而不是承载产品逻辑
-- `.stm32-agent/`
-  运行时状态目录，默认不入库
+仓库中自带 OpenOCD 示例配置：
 
-这意味着当前代码已经从“巨型单文件脚本”走到了“两层拆分”：
+`configs/examples/stm32h750vbt6.openocd.yaml`
 
-- 第一层是 `cli.py -> project.py / state.py / svd.py / debug_support.py`
-- 第二层是 `cli.py -> tools/build.py / tools/flash.py / tools/debug.py / tools/monitor.py / tools/svd.py`
-- 第三层开始出现 `app/context.py` 这种 Agent 入口服务，用来把状态层拼成稳定的消费接口
+### 3. 典型链路
 
-如果后续继续往理想架构演进，更推荐的内部组织会进一步靠近这样：
-
-```text
-src/stm32_agent/
-  app/           主编排循环、上下文构建、会话与后台任务
-  tools/         build / flash / debug / monitor / svd / verify
-  state/         project_profile / session_state / observation / verification
-  adapters/      cli / mcp / jsonrpc / vscode
+```bash
+stm32-agent doctor -c "configs/examples/stm32h750vbt6.openocd.yaml"
+stm32-agent build -c "configs/examples/stm32h750vbt6.openocd.yaml"
+stm32-agent flash -c "configs/examples/stm32h750vbt6.openocd.yaml"
+stm32-agent debug start -c "configs/examples/stm32h750vbt6.openocd.yaml"
+stm32-agent debug snapshot -c "configs/examples/stm32h750vbt6.openocd.yaml" --watch RCC:CR
+stm32-agent debug stop -c "configs/examples/stm32h750vbt6.openocd.yaml"
 ```
 
-当前还没有完全拆到这个目录粒度，但职责边界已经开始按这个方向收口，这是后续继续整理代码结构时更值得靠近的路线。
+---
 
-## 人工验收建议
+## 已完成的真实验证
 
-准备公开后，推荐保留一条清晰的人类验收路径：
+当前仓库内已经做过的真机回归包括：
 
-1. 命令层确认
-   先确认 `build / flash / debug start / snapshot / stop` 都能执行。
-2. 行为层确认
-   再确认 LED、串口 banner、GPIO、任务状态等肉眼可判现象。
-3. 证据层确认
-   最后核对 `.stm32-agent/` 中的 session、log、observation、verification 文件。
+- `doctor`
+- `build`
+- `flash` on OpenOCD
+- `monitor --serial-port COM1 --baudrate 115200 --duration 0.5` 的短时事件流回归
+- `debug start -> debug snapshot --watch RCC:CR -> debug stop` on OpenOCD
+- `debug start --backend stlink -> debug snapshot --watch RCC:CR -> debug stop` on ST-LINK
+- `debug peripheral-read --peripheral RCC --register CR`
+- `debug continue`
+- `svd fetch --chip STM32H750VBT6`
 
-这样以后 Agent 输出“成功”时，永远有一条人类可复核的证据链。
+仓库内的真机样例工程位于：
 
-## 当前已知缺口
+- `workspaces/stm32h750vbt6`
 
-当前已经明确暴露出来、且公开时应该诚实写出的点：
+---
 
-- `ST-LINK` 烧录存在间歇性 verify mismatch，仍在定位
-- 当前主要面向单板、单 session
-- 断点管理、变量观察、表达式求值还未进入 MVP
-- MCP 暴露层和 JSON-RPC 双帧适配还未完成
-- context schema 还会继续收紧，目标是进一步降低 Agent token 开销
+## 当前缺口
 
-## 后续路线图
+以下内容还没有完成，README 也明确按“现状”而不是“理想态”描述：
 
-### 第一阶段：稳定 CLI
+- MCP / JSON-RPC / VS Code adapter 还未实现。
+- 当前主要面向单板、单 session 调试。
+- `monitor` 虽然已经事件流模型化，但仍然是前台阻塞式会话，不是后台任务。
+- `build` / `flash` 当前虽然已结构化，但默认返回里仍可能包含较大的 `stdout/stderr`，后续仍建议增加 `compact / verbose` 分档。
+- `ST-LINK` 烧录链路上历史上出现过 `verify mismatch`，仍需继续收口。
 
-- 收口 `flash --backend stlink` 的可信度问题
-- 继续补齐真实板卡回归
-- 明确错误码、摘要和日志格式
+---
 
-### 第二阶段：收紧上下文模型
+## 下一步更合理的方向
 
-- 收紧 `project_profile / session_state / observation / verification_report`
-- 减少无效 raw text
-- 提高语义化快照密度
-- 明确摘要优先、原始证据按需回退的读取策略
+- 引入 `compact / verbose / evidence` 三档返回策略，主动管理 token 开销。
+- 继续把长时任务改造成后台任务或事件流适配，而不是仅限 CLI 前台阻塞。
+- 为 `interfaces` 之外增加 MCP / JSON-RPC adapter，而不是把协议细节写回 use case。
+- 进一步收紧 snapshot 和 observation schema，降低 Agent token 开销。
+- 为 build / flash / monitor 的结构化结果增加更细的 machine-readable 字段和回归测试。
 
-### 第三阶段：暴露 MCP
+---
 
-- 把 CLI 命令映射成粗粒度 MCP tools
-- 优先暴露语义型接口，而不是逐字节原始输出
-- 让 Agent 面向“调试快照和验证结果”决策，而不是面向原始终端文本决策
+## 设计原则
 
-### 第四阶段：补齐传输兼容性
-
-- 适配 JSON-RPC 双帧格式
-- 增加隔离环境管理
-- 提升跨客户端兼容性和复现效率
-
-### 第五阶段：后台调试子任务
-
-- 让长构建、长监视、长验证进入后台执行
-- 用事件或状态更新把结果回送给主代理
-- 保持交互链路持续可响应
-
-
-
-## 许可证
-
-暂未单独声明。准备公开前，建议补齐仓库许可证、贡献说明和最小 issue 模板。
+- 先让真机链路可执行，再做协议层暴露。
+- 先让状态文件可复核，再做 Agent 自动决策。
+- 先保持 `interfaces -> application -> infrastructure` 边界清晰，再扩展能力。
+- 不要求 Agent 看见全部日志，只要求 Agent 看见足够正确的上下文。
+- 不把 README 写成巨大的命令手册，而把它写成 Agent 和人类都能快速定位系统结构的地图。
